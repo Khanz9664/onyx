@@ -156,6 +156,9 @@ services:
         condition: service_started
       indexing_model_server:
         condition: service_started
+      minio:
+        condition: service_started
+        required: false
     restart: unless-stopped
     environment:
       - FILE_STORE_BACKEND=${FILE_STORE_BACKEND:-s3}
