@@ -2,10 +2,11 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
-import * as SettingsLayouts from "@/layouts/settings-layouts";
+import { SettingsLayouts } from "@opal/layouts";
 import { ADMIN_ROUTES } from "@/lib/admin-routes";
 import { useSettingsContext } from "@/providers/SettingsProvider";
-import { usePaidEnterpriseFeaturesEnabled } from "@/components/settings/usePaidEnterpriseFeaturesEnabled";
+import { useTierAtLeast } from "@/hooks/useTierAtLeast";
+import { Tier } from "@/interfaces/settings";
 import { useHookSpecs } from "@/ee/hooks/useHookSpecs";
 import { useHooks } from "@/ee/hooks/useHooks";
 import useFilter from "@/hooks/useFilter";
@@ -22,6 +23,7 @@ import { Content, IllustrationContent } from "@opal/layouts";
 import Modal from "@/refresh-components/Modal";
 import {
   SvgArrowExchange,
+  SvgArrowRightDot,
   SvgBubbleText,
   SvgFileBroadcast,
   SvgShareWebhook,
@@ -33,7 +35,7 @@ import {
 } from "@opal/icons";
 import type { IconFunctionComponent } from "@opal/types";
 import { SvgNoResult, SvgEmpty } from "@opal/illustrations";
-import InputTypeIn from "@/refresh-components/inputs/InputTypeIn";
+import { InputTypeIn } from "@opal/components";
 import HookFormModal from "@/ee/refresh-pages/admin/HooksPage/HookFormModal";
 import HookStatusPopover from "@/ee/refresh-pages/admin/HooksPage/HookStatusPopover";
 import {
@@ -53,6 +55,7 @@ const route = ADMIN_ROUTES.HOOKS;
 
 const HOOK_POINT_ICONS: Record<string, IconFunctionComponent> = {
   document_ingestion: SvgFileBroadcast,
+  document_push: SvgArrowRightDot,
   query_processing: SvgBubbleText,
 };
 
@@ -387,12 +390,12 @@ function ConnectedHookCard({
               </div>
 
               <Disabled disabled={isBusy}>
-                <div className="flex items-center pb-1 px-1 gap-1">
+                <div className="flex items-center justify-end pb-1 px-1 gap-1">
                   {hook.is_active ? (
                     <>
                       <Hoverable.Item
                         group="connected-hook-card"
-                        variant="opacity-on-hover"
+                        variant="appear-on-hover"
                       >
                         <Button
                           prominence="tertiary"
@@ -447,7 +450,7 @@ function ConnectedHookCard({
 export default function HooksPage() {
   const router = useRouter();
   const { settings, settingsLoading } = useSettingsContext();
-  const isEE = usePaidEnterpriseFeaturesEnabled();
+  const enterpriseTier = useTierAtLeast(Tier.ENTERPRISE);
 
   const [connectSpec, setConnectSpec] = useState<HookPointMeta | null>(null);
   const [editHook, setEditHook] = useState<HookResponse | null>(null);
@@ -505,16 +508,16 @@ export default function HooksPage() {
 
   useEffect(() => {
     if (settingsLoading) return;
-    if (!isEE) {
+    if (!enterpriseTier) {
       toast.info("Hook Extensions require an Enterprise license.");
       router.replace("/");
     } else if (!settings.hooks_enabled) {
       toast.info("Hook Extensions are not enabled for this deployment.");
       router.replace("/");
     }
-  }, [settingsLoading, isEE, settings.hooks_enabled, router]);
+  }, [settingsLoading, enterpriseTier, settings.hooks_enabled, router]);
 
-  if (settingsLoading || !isEE || !settings.hooks_enabled) {
+  if (settingsLoading || !enterpriseTier || !settings.hooks_enabled) {
     return <SimpleLoader />;
   }
 
@@ -534,9 +537,8 @@ export default function HooksPage() {
   }
 
   function handleHookDeleted(id: number) {
-    mutate(
-      (prev: HookResponse[] | undefined) =>
-        prev?.filter((h: HookResponse) => h.id !== id)
+    mutate((prev: HookResponse[] | undefined) =>
+      prev?.filter((h: HookResponse) => h.id !== id)
     );
   }
 
@@ -578,7 +580,7 @@ export default function HooksPage() {
           icon={route.icon}
           title={route.title}
           description="Extend Onyx pipelines by registering external API endpoints as callbacks at predefined hook points."
-          separator
+          divider
         />
         <SettingsLayouts.Body>
           {isLoading ? (
@@ -596,7 +598,7 @@ export default function HooksPage() {
                   placeholder="Search hooks..."
                   value={search}
                   variant="internal"
-                  leftSearchIcon
+                  searchIcon
                   onChange={(e) => setSearch(e.target.value)}
                 />
               </div>

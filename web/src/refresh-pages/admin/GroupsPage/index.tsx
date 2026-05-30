@@ -6,7 +6,7 @@ import { useRouter } from "next/navigation";
 import useSWR from "swr";
 import { SvgExternalLink, SvgUsers } from "@opal/icons";
 import { Button, MessageCard } from "@opal/components";
-import * as SettingsLayouts from "@/layouts/settings-layouts";
+import { SettingsLayouts } from "@opal/layouts";
 import SimpleLoader from "@/refresh-components/loaders/SimpleLoader";
 import { errorHandlingFetcher } from "@/lib/fetcher";
 import type { UserGroup } from "@/lib/types";
@@ -29,7 +29,7 @@ function GroupsPage() {
   return (
     <SettingsLayouts.Root>
       <div data-testid="groups-page-heading">
-        <SettingsLayouts.Header icon={SvgUsers} title="Groups" separator>
+        <SettingsLayouts.Header icon={SvgUsers} title="Groups" divider>
           <MessageCard
             variant="info"
             title="Upcoming changes to permissions"

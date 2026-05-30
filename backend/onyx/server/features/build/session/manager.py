@@ -4,9 +4,15 @@ SessionManager is the main entry point for build session lifecycle management.
 It orchestrates session CRUD, message handling, artifact management, and file system access.
 """
 
+import contextlib
+import hashlib
 import io
 import json
 import mimetypes
+import queue as queue_lib
+import threading
+import time
+import uuid
 import zipfile
 from collections.abc import Generator
 from datetime import datetime
@@ -15,48 +21,48 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from acp.schema import AgentMessageChunk
-from acp.schema import AgentPlanUpdate
-from acp.schema import AgentThoughtChunk
-from acp.schema import CurrentModeUpdate
-from acp.schema import Error as ACPError
-from acp.schema import PromptResponse
-from acp.schema import ToolCallProgress
-from acp.schema import ToolCallStart
+import httpx
 from sqlalchemy.orm import Session as DBSession
 
+from onyx.cache.factory import get_cache_backend
 from onyx.configs.app_configs import WEB_DOMAIN
 from onyx.configs.constants import MessageType
 from onyx.db.enums import SandboxStatus
-from onyx.db.llm import fetch_default_llm_model
+from onyx.db.enums import SessionOrigin
 from onyx.db.models import BuildMessage
 from onyx.db.models import BuildSession
+from onyx.db.models import Sandbox
 from onyx.db.models import User
 from onyx.db.users import fetch_user_by_id
+from onyx.error_handling.error_codes import OnyxErrorCode
+from onyx.error_handling.exceptions import OnyxError
+from onyx.file_store.file_store import get_default_file_store
 from onyx.llm.factory import get_default_llm
 from onyx.llm.models import LanguageModelInput
 from onyx.llm.models import ReasoningEffort
 from onyx.llm.models import SystemMessage
 from onyx.llm.models import UserMessage
 from onyx.llm.utils import llm_response_to_string
+from onyx.sandbox_proxy import approval_cache
 from onyx.server.features.build.api.models import DirectoryListing
 from onyx.server.features.build.api.models import FileSystemEntry
 from onyx.server.features.build.api.packet_logger import get_packet_logger
 from onyx.server.features.build.api.packet_logger import log_separator
+from onyx.server.features.build.api.packets import ApprovalRequestedPacket
 from onyx.server.features.build.api.packets import BuildPacket
 from onyx.server.features.build.api.packets import ErrorPacket
 from onyx.server.features.build.api.rate_limit import get_user_rate_limit_status
+from onyx.server.features.build.configs import BUILD_MODE_ALLOWED_PROVIDER_TYPES
+from onyx.server.features.build.configs import BUILD_MODE_RECOMMENDED_MODEL_BY_TYPE
 from onyx.server.features.build.configs import MAX_TOTAL_UPLOAD_SIZE_BYTES
 from onyx.server.features.build.configs import MAX_UPLOAD_FILES_PER_SESSION
-from onyx.server.features.build.configs import PERSISTENT_DOCUMENT_STORAGE_PATH
-from onyx.server.features.build.configs import SANDBOX_BACKEND
-from onyx.server.features.build.configs import SandboxBackend
+from onyx.server.features.build.configs import SANDBOX_MAX_CONCURRENT_PER_ORG
 from onyx.server.features.build.db.build_session import allocate_nextjs_port
 from onyx.server.features.build.db.build_session import create_build_session__no_commit
 from onyx.server.features.build.db.build_session import create_message
 from onyx.server.features.build.db.build_session import delete_build_session__no_commit
 from onyx.server.features.build.db.build_session import (
-    fetch_llm_provider_by_type_for_build_mode,
+    fetch_all_supported_build_llm_providers,
 )
 from onyx.server.features.build.db.build_session import get_build_session
 from onyx.server.features.build.db.build_session import get_empty_session_for_user
@@ -65,26 +71,34 @@ from onyx.server.features.build.db.build_session import get_user_build_sessions
 from onyx.server.features.build.db.build_session import update_session_activity
 from onyx.server.features.build.db.build_session import upsert_agent_plan
 from onyx.server.features.build.db.sandbox import create_sandbox__no_commit
+from onyx.server.features.build.db.sandbox import ensure_sandbox_pat
 from onyx.server.features.build.db.sandbox import get_running_sandbox_count_by_tenant
 from onyx.server.features.build.db.sandbox import get_sandbox_by_session_id
 from onyx.server.features.build.db.sandbox import get_sandbox_by_user_id
 from onyx.server.features.build.db.sandbox import get_snapshots_for_session
 from onyx.server.features.build.db.sandbox import update_sandbox_heartbeat
 from onyx.server.features.build.db.sandbox import update_sandbox_status__no_commit
-from onyx.server.features.build.sandbox import get_sandbox_manager
-from onyx.server.features.build.sandbox.kubernetes.internal.acp_exec_client import (
-    SSEKeepalive,
-)
+from onyx.server.features.build.sandbox.base import get_sandbox_manager
+from onyx.server.features.build.sandbox.event_schema import AgentMessageChunk
+from onyx.server.features.build.sandbox.event_schema import AgentPlanUpdate
+from onyx.server.features.build.sandbox.event_schema import AgentThoughtChunk
+from onyx.server.features.build.sandbox.event_schema import CurrentModeUpdate
+from onyx.server.features.build.sandbox.event_schema import Error as SandboxError
+from onyx.server.features.build.sandbox.event_schema import PromptResponse
+from onyx.server.features.build.sandbox.event_schema import ToolCallProgress
+from onyx.server.features.build.sandbox.event_schema import ToolCallStart
+from onyx.server.features.build.sandbox.manager.snapshot_manager import SnapshotManager
+from onyx.server.features.build.sandbox.models import FileSet
 from onyx.server.features.build.sandbox.models import LLMProviderConfig
-from onyx.server.features.build.sandbox.tasks.tasks import (
-    _get_disabled_user_library_paths,
-)
+from onyx.server.features.build.sandbox.sse import SSEKeepalive
+from onyx.server.features.build.sandbox.user_library import hydrate_user_library
+from onyx.server.features.build.session.md_to_docx import markdown_to_docx_bytes
 from onyx.server.features.build.session.prompts import BUILD_NAMING_SYSTEM_PROMPT
 from onyx.server.features.build.session.prompts import BUILD_NAMING_USER_PROMPT
-from onyx.server.features.build.session.prompts import (
-    FOLLOWUP_SUGGESTIONS_SYSTEM_PROMPT,
-)
-from onyx.server.features.build.session.prompts import FOLLOWUP_SUGGESTIONS_USER_PROMPT
+from onyx.server.manage.llm.models import LLMProviderView
+from onyx.skills.push import build_user_skills_payload
+from onyx.skills.push import hydrate_sandbox_skills
+from onyx.tracing.flows import LLMFlow
 from onyx.tracing.framework.create import ensure_trace
 from onyx.tracing.llm_utils import llm_generation_span
 from onyx.tracing.llm_utils import record_llm_response
@@ -95,14 +109,60 @@ from shared_configs.contextvars import get_current_tenant_id
 logger = setup_logger()
 
 
+def _model_for_provider(provider: LLMProviderView) -> str | None:
+    """The Craft model to register for ``provider``: the type's recommended
+    model when defined, else the first visible model. None if the provider has
+    no usable (visible) model."""
+    visible_models = [m for m in provider.model_configurations if m.is_visible]
+    if not visible_models:
+        return None
+    return BUILD_MODE_RECOMMENDED_MODEL_BY_TYPE.get(
+        provider.provider, visible_models[0].name
+    )
+
+
+def get_all_build_mode_llm_configs(
+    providers: list[LLMProviderView],
+    default: LLMProviderConfig,
+) -> list[LLMProviderConfig]:
+    """``default`` first, then one config per other supported provider type
+    from ``providers`` (an already-fetched, access-filtered list). Used at
+    sandbox provision time so every configured provider is pre-registered in
+    opencode.json and per-prompt model overrides can cross providers without a
+    pod restart.
+    """
+    configs: list[LLMProviderConfig] = [default]
+    seen_providers: set[str] = {default.provider}
+    for provider in providers:
+        if provider.provider in seen_providers:
+            continue
+        model_name = _model_for_provider(provider)
+        if model_name is None:
+            continue
+        seen_providers.add(provider.provider)
+        configs.append(
+            LLMProviderConfig(
+                provider=provider.provider,
+                model_name=model_name,
+                api_key=provider.api_key,
+                api_base=provider.api_base,
+            )
+        )
+    return configs
+
+
 class UploadLimitExceededError(ValueError):
     """Raised when file upload limits are exceeded."""
 
 
-class BuildStreamingState:
-    """Container for accumulating state during ACP streaming.
+class SandboxProvisioningError(RuntimeError):
+    """Raised when a sandbox is mid-provision and the caller cannot wait it out."""
 
-    Similar to ChatStateContainer but adapted for ACP packet types.
+
+class BuildStreamingState:
+    """Container for accumulating state during sandbox-event streaming.
+
+    Similar to ChatStateContainer but adapted for sandbox event packet types.
     Accumulates chunks and tracks pending tool calls until completion.
 
     Usage:
@@ -303,61 +363,72 @@ class SessionManager:
     # LLM Configuration
     # =========================================================================
 
-    def _get_llm_config(
+    def build_llm_configs(
         self,
+        user: User,
+        requested_provider_type: str | None = None,
+        requested_model_name: str | None = None,
+    ) -> tuple[LLMProviderConfig, list[LLMProviderConfig]]:
+        """Single access-scoped fetch → (default config, all pre-registered
+        configs). ``configs[0]`` is the default. Used at provision time so the
+        default and the cross-provider override list share one DB read.
+
+        Raises:
+            OnyxError: If no accessible supported provider is configured.
+        """
+        providers = fetch_all_supported_build_llm_providers(self._db_session, user)
+        default = self._select_default_llm_config(
+            providers, requested_provider_type, requested_model_name
+        )
+        return default, get_all_build_mode_llm_configs(providers, default)
+
+    @staticmethod
+    def _select_default_llm_config(
+        providers: list[LLMProviderView],
         requested_provider_type: str | None,
         requested_model_name: str | None,
     ) -> LLMProviderConfig:
-        """Get LLM config for sandbox provisioning.
-
-        Resolution priority:
-        1. User's requested provider/model (from cookie)
-        2. System default provider
-
-        Args:
-            requested_provider_type: Provider type from user's cookie (e.g., "anthropic", "openai")
-            requested_model_name: Model name from user's cookie (e.g., "claude-opus-4-5")
-
-        Returns:
-            LLMProviderConfig for sandbox provisioning
+        """Resolution priority over an already-fetched accessible list:
+        1. The user's requested provider/model (cookie), if the type is present.
+           The model is used verbatim — the provider's API rejects invalid
+           models, so this also allows models not marked "visible".
+        2. Highest-priority supported provider with its recommended model.
 
         Raises:
-            ValueError: If no LLM provider is configured
+            OnyxError: If no accessible supported provider is configured.
         """
         if requested_provider_type and requested_model_name:
-            # Look up provider by type (e.g., "anthropic", "openai", "openrouter")
-            provider = fetch_llm_provider_by_type_for_build_mode(
-                self._db_session, requested_provider_type
+            for provider in providers:
+                if provider.provider == requested_provider_type:
+                    return LLMProviderConfig(
+                        provider=provider.provider,
+                        model_name=requested_model_name,
+                        api_key=provider.api_key,
+                        api_base=provider.api_base,
+                    )
+            logger.warning(
+                "Requested provider type %s not accessible, falling back",
+                requested_provider_type,
             )
-            if provider:
-                # Use the requested model directly - the provider's API will
-                # reject invalid models. This allows users to use models that
-                # aren't explicitly configured as "visible" in the admin UI.
+
+        for provider_type in BUILD_MODE_ALLOWED_PROVIDER_TYPES:
+            for provider in providers:
+                if provider.provider != provider_type:
+                    continue
+                model_name = _model_for_provider(provider)
+                if model_name is None:
+                    continue
                 return LLMProviderConfig(
                     provider=provider.provider,
-                    model_name=requested_model_name,
+                    model_name=model_name,
                     api_key=provider.api_key,
                     api_base=provider.api_base,
                 )
-            else:
-                logger.warning(
-                    f"Requested provider type {requested_provider_type} not found, falling back to default"
-                )
 
-        # Fallback to system default
-        default_model = fetch_default_llm_model(self._db_session)
-        if not default_model:
-            raise ValueError("No default LLM model found")
-
-        return LLMProviderConfig(
-            provider=default_model.llm_provider.provider,
-            model_name=default_model.name,
-            api_key=(
-                default_model.llm_provider.api_key.get_value(apply_mask=False)
-                if default_model.llm_provider.api_key
-                else None
-            ),
-            api_base=default_model.llm_provider.api_base,
+        raise OnyxError(
+            OnyxErrorCode.INVALID_INPUT,
+            "No accessible LLM provider of a supported type "
+            f"({', '.join(BUILD_MODE_ALLOWED_PROVIDER_TYPES)}) is configured.",
         )
 
     # =========================================================================
@@ -378,15 +449,201 @@ class SessionManager:
         """
         return get_user_build_sessions(user_id, self._db_session)
 
+    def _hydrate_skills(
+        self, sandbox_id: UUID, user: User, files: FileSet | None = None
+    ) -> None:
+        try:
+            hydrate_sandbox_skills(sandbox_id, user, self._db_session, files=files)
+        except Exception:
+            logger.warning(
+                "Failed to push skills to sandbox %s", sandbox_id, exc_info=True
+            )
+
+    def _hydrate_user_library(self, sandbox_id: UUID, user_id: UUID) -> None:
+        try:
+            hydrate_user_library(sandbox_id, user_id, self._db_session)
+        except Exception:
+            logger.warning(
+                "Failed to push user library to sandbox %s", sandbox_id, exc_info=True
+            )
+
+    def _provision_sandbox(
+        self,
+        sandbox: Sandbox,
+        user: User,
+        user_id: UUID,
+        tenant_id: str,
+        all_llm_configs: list[LLMProviderConfig],
+    ) -> None:
+        """Ensure PAT, then provision the pod with every configured provider
+        pre-loaded so per-prompt model overrides can cross providers without a
+        pod restart. ``all_llm_configs[0]`` is the default model."""
+        onyx_pat = ensure_sandbox_pat(self._db_session, sandbox, user)
+        sandbox_info = self._sandbox_manager.provision(
+            sandbox_id=sandbox.id,
+            user_id=user_id,
+            tenant_id=tenant_id,
+            llm_config=all_llm_configs[0],
+            onyx_pat=onyx_pat,
+            all_llm_configs=all_llm_configs,
+        )
+        update_sandbox_status__no_commit(
+            self._db_session, sandbox.id, sandbox_info.status
+        )
+
+    def ensure_sandbox_running(
+        self,
+        user_id: UUID,
+        *,
+        provisioning_wait_seconds: float = 30.0,
+    ) -> Sandbox:
+        """Ensure the user has a RUNNING sandbox, creating/waking as needed.
+
+        Headless entry point for flows (e.g. scheduled tasks) that need the
+        sandbox up but aren't going through ``create_session__no_commit``.
+        Mirrors the sandbox-handling section of ``create_session__no_commit``
+        but without creating a session record. Falls back to the system
+        default LLM config since there is no user cookie context.
+
+        Behavior by current sandbox status:
+        - No sandbox row: creates one and provisions it.
+        - ``RUNNING`` + pod healthy: returns as-is.
+        - ``RUNNING`` + pod missing/unhealthy: terminates and re-provisions.
+        - ``SLEEPING`` / ``TERMINATED`` / ``FAILED``: re-provisions in place.
+        - ``PROVISIONING``: polls up to ``provisioning_wait_seconds`` (default
+          30s) for the concurrent provisioner to finish, then continues
+          based on the resulting status. Raises
+          ``SandboxProvisioningError`` only if the timeout elapses without
+          a transition.
+
+        Honors ``SANDBOX_MAX_CONCURRENT_PER_ORG`` when ``MULTI_TENANT`` for
+        any path that newly counts toward the running limit (creating a new
+        sandbox or waking a SLEEPING / TERMINATED / FAILED one).
+
+        Caller is responsible for committing.
+
+        Raises:
+            SandboxProvisioningError: Sandbox was still PROVISIONING after
+                the wait timeout elapsed.
+            ValueError: Max concurrent sandboxes reached, or user missing.
+            RuntimeError: Sandbox manager failed to provision the pod.
+        """
+        sandbox = get_sandbox_by_user_id(self._db_session, user_id)
+
+        # If a concurrent caller is mid-provision, wait for them rather
+        # than race. We re-enter the state machine below with whatever
+        # status the row ends up in.
+        if sandbox is not None and sandbox.status == SandboxStatus.PROVISIONING:
+            sandbox = self._wait_for_provisioning_to_complete(
+                sandbox, provisioning_wait_seconds
+            )
+
+        # RUNNING + healthy is the hot path — return immediately.
+        if sandbox is not None and sandbox.status == SandboxStatus.RUNNING:
+            if self._sandbox_manager.health_check(sandbox.id, timeout=5.0):
+                return sandbox
+            # DB says RUNNING but the pod is gone; fall through to
+            # terminate + re-provision below.
+            logger.warning(
+                "Sandbox %s marked RUNNING but pod is unhealthy/missing; recovering.",
+                sandbox.id,
+            )
+            self._sandbox_manager.terminate(sandbox.id)
+            update_sandbox_status__no_commit(
+                self._db_session, sandbox.id, SandboxStatus.TERMINATED
+            )
+
+        # All remaining branches will (re-)provision a pod, so honor
+        # per-tenant concurrency limits up front. We skip this check for
+        # the RUNNING+healthy path above because it doesn't add to the
+        # running count.
+        tenant_id = get_current_tenant_id()
+        if MULTI_TENANT:
+            running_count = get_running_sandbox_count_by_tenant(
+                self._db_session, tenant_id
+            )
+            if running_count >= SANDBOX_MAX_CONCURRENT_PER_ORG:
+                raise ValueError(
+                    f"Maximum concurrent sandboxes ({SANDBOX_MAX_CONCURRENT_PER_ORG}) reached"
+                )
+
+        user = fetch_user_by_id(self._db_session, user_id)
+        if user is None:
+            raise ValueError(f"User {user_id} not found")
+
+        _, all_llm_configs = self.build_llm_configs(user)
+
+        if sandbox is None:
+            sandbox = create_sandbox__no_commit(
+                db_session=self._db_session,
+                user_id=user_id,
+            )
+            logger.info(
+                "Created sandbox %s for user %s (headless provisioning)",
+                sandbox.id,
+                user_id,
+            )
+        else:
+            logger.info(
+                "Waking sandbox %s (status=%s) for user %s",
+                sandbox.id,
+                sandbox.status.value,
+                user_id,
+            )
+
+        self._provision_sandbox(sandbox, user, user_id, tenant_id, all_llm_configs)
+        return sandbox
+
+    def _wait_for_provisioning_to_complete(
+        self,
+        sandbox: Sandbox,
+        wait_seconds: float,
+        *,
+        poll_interval_seconds: float = 1.0,
+    ) -> Sandbox:
+        """Poll a PROVISIONING sandbox until it transitions or we time out.
+
+        Returns the same ``Sandbox`` object with refreshed attributes once
+        ``status`` is no longer ``PROVISIONING``. We rely on Postgres'
+        default READ COMMITTED isolation: ``session.refresh()`` issues a
+        fresh SELECT each iteration, so commits from the concurrent
+        provisioner become visible.
+
+        Raises:
+            SandboxProvisioningError: Status was still ``PROVISIONING``
+                when the deadline elapsed.
+        """
+        deadline = time.monotonic() + wait_seconds
+        started = time.monotonic()
+        logger.info(
+            "Waiting up to %.1fs for sandbox %s to finish provisioning",
+            wait_seconds,
+            sandbox.id,
+        )
+        while True:
+            self._db_session.refresh(sandbox)
+            if sandbox.status != SandboxStatus.PROVISIONING:
+                logger.info(
+                    "Sandbox %s left PROVISIONING after %.1fs (now=%s)",
+                    sandbox.id,
+                    time.monotonic() - started,
+                    sandbox.status.value,
+                )
+                return sandbox
+            if time.monotonic() >= deadline:
+                raise SandboxProvisioningError(
+                    f"Sandbox {sandbox.id} still PROVISIONING after {wait_seconds}s"
+                )
+            time.sleep(poll_interval_seconds)
+
     def create_session__no_commit(
         self,
         user_id: UUID,
         name: str | None = None,
-        user_work_area: str | None = None,
-        user_level: str | None = None,
         llm_provider_type: str | None = None,
         llm_model_name: str | None = None,
-        demo_data_enabled: bool = True,
+        origin: SessionOrigin = SessionOrigin.INTERACTIVE,
+        headless: bool = False,
     ) -> BuildSession:
         """
         Create a new build session with a sandbox.
@@ -398,11 +655,11 @@ class SessionManager:
         Args:
             user_id: The user ID
             name: Optional session name
-            user_work_area: User's work area for demo persona (e.g., "engineering")
-            user_level: User's level for demo persona (e.g., "ic", "manager")
             llm_provider_type: Provider type from user's cookie (e.g., "anthropic", "openai")
             llm_model_name: Model name from user's cookie (e.g., "claude-opus-4-5")
-            demo_data_enabled: Explicit flag for demo data mode. Defaults to True if not provided.
+            origin: Provenance of the session. INTERACTIVE (default) sessions
+                appear in the Craft sidebar; SCHEDULED sessions (created by
+                the scheduled-tasks executor) are excluded.
 
         Returns:
             The created BuildSession model
@@ -415,10 +672,6 @@ class SessionManager:
 
         # Check sandbox limits for multi-tenant deployments
         if MULTI_TENANT:
-            from onyx.server.features.build.configs import (
-                SANDBOX_MAX_CONCURRENT_PER_ORG,
-            )
-
             running_count = get_running_sandbox_count_by_tenant(
                 self._db_session, tenant_id
             )
@@ -427,41 +680,44 @@ class SessionManager:
                     f"Maximum concurrent sandboxes ({SANDBOX_MAX_CONCURRENT_PER_ORG}) reached"
                 )
 
-        # Get LLM config (uses user's selection or falls back to default)
-        llm_config = self._get_llm_config(llm_provider_type, llm_model_name)
+        # Fetch user early — needed for provider access checks, PAT, AGENTS.md.
+        user = fetch_user_by_id(self._db_session, user_id)
+        if not user:
+            raise ValueError(f"User {user_id} not found")
 
-        # Build tenant/user-specific path for FILE_SYSTEM documents (sandbox isolation)
-        # Each user's sandbox can only access documents they created
-        # Path structure: {base_path}/{tenant_id}/knowledge/{user_id}/
-        # This matches the path structure used by PersistentDocumentWriter
-        if PERSISTENT_DOCUMENT_STORAGE_PATH:
-            user_file_system_path = str(
-                Path(PERSISTENT_DOCUMENT_STORAGE_PATH)
-                / tenant_id
-                / "knowledge"
-                / str(user_id)
-            )
+        # Resolve the default + all pre-registered provider configs in one read.
+        llm_config, all_llm_configs = self.build_llm_configs(
+            user, llm_provider_type, llm_model_name
+        )
+
+        # Allocate port for this session (per-session port allocation).
+        # Both LOCAL and KUBERNETES backends use the same port allocation
+        # strategy. Skipped for SCHEDULED sessions: scheduled-task fires
+        # are headless, never attach a preview, and pile up so fast they'd
+        # exhaust the [3010, 3100) range on a busy tenant.
+        nextjs_port: int | None
+        if origin == SessionOrigin.SCHEDULED or headless:
+            nextjs_port = None
         else:
-            # Fallback for local development without persistent storage
-            user_file_system_path = "/tmp/onyx-files"
-
-        # Ensure the user's document directory exists (if local)
-        if SANDBOX_BACKEND == SandboxBackend.LOCAL:
-            Path(user_file_system_path).mkdir(parents=True, exist_ok=True)
-
-        # Allocate port for this session (per-session port allocation)
-        # Both LOCAL and KUBERNETES backends use the same port allocation strategy
-        nextjs_port = allocate_nextjs_port(self._db_session)
+            nextjs_port = allocate_nextjs_port(self._db_session)
 
         # Create BuildSession record with allocated port (uses flush, caller commits)
         build_session = create_build_session__no_commit(
-            user_id, self._db_session, name=name, demo_data_enabled=demo_data_enabled
+            user_id,
+            self._db_session,
+            name=name,
+            origin=origin,
+            agent_provider=llm_config.provider,
+            agent_model=llm_config.model_name,
         )
         build_session.nextjs_port = nextjs_port
         self._db_session.flush()
         session_id = str(build_session.id)
         logger.info(
-            f"Created build session {session_id} for user {user_id} (port: {nextjs_port})"
+            "Created build session %s for user %s (port: %s)",
+            session_id,
+            user_id,
+            nextjs_port,
         )
 
         # Check if user already has a sandbox (one sandbox per user model)
@@ -479,23 +735,21 @@ class SessionManager:
             ):
                 # Re-provision sandbox (pod doesn't exist or failed)
                 logger.info(
-                    f"Re-provisioning {sandbox.status.value} sandbox {sandbox_id} for user {user_id}"
+                    "Re-provisioning %s sandbox %s for user %s",
+                    sandbox.status.value,
+                    sandbox_id,
+                    user_id,
                 )
-                sandbox_info = self._sandbox_manager.provision(
-                    sandbox_id=sandbox_id,
-                    user_id=user_id,
-                    tenant_id=tenant_id,
-                    llm_config=llm_config,
-                )
-                # Use update function to also set heartbeat when transitioning to RUNNING
-                update_sandbox_status__no_commit(
-                    self._db_session, sandbox_id, sandbox_info.status
+                self._provision_sandbox(
+                    sandbox, user, user_id, tenant_id, all_llm_configs
                 )
             elif sandbox.status.is_active():
                 # Verify pod is healthy before reusing (use short timeout for quick check)
                 if not self._sandbox_manager.health_check(sandbox_id, timeout=5.0):
                     logger.warning(
-                        f"Sandbox {sandbox_id} marked as {sandbox.status} but pod is unhealthy/missing. Entering recovery mode."
+                        "Sandbox %s marked as %s but pod is unhealthy/missing. Entering recovery mode.",
+                        sandbox_id,
+                        sandbox.status,
                     )
                     # Terminate to clean up any lingering K8s resources
                     self._sandbox_manager.terminate(sandbox_id)
@@ -506,21 +760,17 @@ class SessionManager:
                     )
 
                     logger.info(
-                        f"Re-provisioning sandbox {sandbox_id} for user {user_id}"
+                        "Re-provisioning sandbox %s for user %s", sandbox_id, user_id
                     )
-                    sandbox_info = self._sandbox_manager.provision(
-                        sandbox_id=sandbox_id,
-                        user_id=user_id,
-                        tenant_id=tenant_id,
-                        llm_config=llm_config,
-                    )
-                    # Use update function to also set heartbeat when transitioning to RUNNING
-                    update_sandbox_status__no_commit(
-                        self._db_session, sandbox_id, sandbox_info.status
+                    self._provision_sandbox(
+                        sandbox, user, user_id, tenant_id, all_llm_configs
                     )
                 else:
                     logger.info(
-                        f"Reusing existing sandbox {sandbox_id} (status: {sandbox.status}) for new session {session_id}"
+                        "Reusing existing sandbox %s (status: %s) for new session %s",
+                        sandbox_id,
+                        sandbox.status,
+                        session_id,
                     )
             else:
                 # PROVISIONING status - sandbox is being created by another request
@@ -538,60 +788,39 @@ class SessionManager:
                 user_id=user_id,
             )
             sandbox_id = sandbox.id
-            logger.info(f"Created sandbox record {sandbox_id} for session {session_id}")
-
-            # Provision sandbox (no DB operations inside)
-            sandbox_info = self._sandbox_manager.provision(
-                sandbox_id=sandbox_id,
-                user_id=user_id,
-                tenant_id=tenant_id,
-                llm_config=llm_config,
+            logger.info(
+                "Created sandbox record %s for session %s", sandbox_id, session_id
             )
 
-            # Update sandbox status (also refreshes heartbeat when transitioning to RUNNING)
-            update_sandbox_status__no_commit(
-                self._db_session, sandbox_id, sandbox_info.status
-            )
+            self._provision_sandbox(sandbox, user, user_id, tenant_id, all_llm_configs)
 
         # Set up session workspace within the sandbox
         logger.info(
-            f"Setting up session workspace {session_id} in sandbox {sandbox.id}"
+            "Setting up session workspace %s in sandbox %s", session_id, sandbox.id
         )
-        # Fetch user data for personalization in AGENTS.md
-        user = fetch_user_by_id(self._db_session, user_id)
-        user_name = user.personal_name if user else None
-        user_role = user.personal_role if user else None
+        user_name = user.personal_name
+        user_role = user.personal_role
 
-        # Get excluded user library paths (files with sync_disabled=True)
-        # Only query if not using demo data (user library only applies to user files)
-        excluded_user_library_paths: list[str] | None = None
-        if not demo_data_enabled:
-            excluded_user_library_paths = _get_disabled_user_library_paths(
-                self._db_session, str(user_id)
-            )
-            if excluded_user_library_paths:
-                logger.debug(
-                    f"Excluding {len(excluded_user_library_paths)} disabled user library paths"
-                )
+        skills_section, skills_files = build_user_skills_payload(user, self._db_session)
 
         self._sandbox_manager.setup_session_workspace(
             sandbox_id=sandbox.id,
             session_id=build_session.id,
             llm_config=llm_config,
             nextjs_port=nextjs_port,
-            file_system_path=user_file_system_path,
+            skills_section=skills_section,
             snapshot_path=None,  # TODO: Support restoring from snapshot
             user_name=user_name,
             user_role=user_role,
-            user_work_area=user_work_area,
-            user_level=user_level,
-            use_demo_data=demo_data_enabled,
-            excluded_user_library_paths=excluded_user_library_paths,
         )
+        self._hydrate_skills(sandbox.id, user, files=skills_files)
+        self._hydrate_user_library(sandbox.id, user_id)
 
         sandbox_id = sandbox.id
         logger.info(
-            f"Successfully created session {session_id} with workspace in sandbox {sandbox.id}"
+            "Successfully created session %s with workspace in sandbox %s",
+            session_id,
+            sandbox.id,
         )
 
         return build_session
@@ -599,28 +828,22 @@ class SessionManager:
     def get_or_create_empty_session(
         self,
         user_id: UUID,
-        user_work_area: str | None = None,
-        user_level: str | None = None,
         llm_provider_type: str | None = None,
         llm_model_name: str | None = None,
-        demo_data_enabled: bool = True,
+        headless: bool = False,
     ) -> BuildSession:
         """Get existing empty session or create a new one with provisioned sandbox.
 
         Used for pre-provisioning sandboxes when user lands on /build/v1.
-        Returns existing recent empty session if one exists, has a healthy sandbox,
-        AND has matching demo_data_enabled setting. Otherwise creates new.
+        Returns existing recent empty session if one exists and has a healthy sandbox.
         If an empty session exists but its sandbox is unhealthy/terminated/missing,
         the stale session is deleted and a fresh one is created (which will handle
         sandbox recovery/re-provisioning).
 
         Args:
             user_id: The user ID
-            user_work_area: User's work area for demo persona (e.g., "engineering")
-            user_level: User's level for demo persona (e.g., "ic", "manager")
             llm_provider_type: Provider type from user's cookie (e.g., "anthropic", "openai")
             llm_model_name: Model name from user's cookie (e.g., "claude-opus-4-5")
-            demo_data_enabled: Explicit flag for demo data mode. Defaults to True if not provided.
 
         Returns:
             BuildSession (existing empty or newly created)
@@ -629,13 +852,10 @@ class SessionManager:
             ValueError: If max concurrent sandboxes reached
             RuntimeError: If sandbox provisioning fails
         """
-        # Look for existing empty session with matching demo_data setting
-        existing = get_empty_session_for_user(
-            user_id, self._db_session, demo_data_enabled=demo_data_enabled
-        )
+        existing = get_empty_session_for_user(user_id, self._db_session)
         if existing:
             logger.info(
-                f"Existing empty session {existing.id} found for user {user_id}"
+                "Existing empty session %s found for user %s", existing.id, user_id
             )
             # Verify sandbox is healthy before returning existing session
             sandbox = get_sandbox_by_user_id(self._db_session, user_id)
@@ -652,24 +872,35 @@ class SessionManager:
                     )
                 )
                 if is_healthy and workspace_exists:
+                    user = fetch_user_by_id(self._db_session, user_id)
+                    if user is None:
+                        logger.warning("Cannot push skills: user %s not found", user_id)
+                    else:
+                        self._hydrate_skills(sandbox.id, user)
+                    self._hydrate_user_library(sandbox.id, user_id)
                     logger.info(
-                        f"Returning existing empty session {existing.id} for user {user_id}"
+                        "Returning existing empty session %s for user %s",
+                        existing.id,
+                        user_id,
                     )
                     return existing
                 elif not is_healthy:
                     logger.warning(
-                        f"Empty session {existing.id} has unhealthy sandbox {sandbox.id}. Deleting and creating fresh session."
+                        "Empty session %s has unhealthy sandbox %s. Deleting and creating fresh session.",
+                        existing.id,
+                        sandbox.id,
                     )
                 else:
                     logger.warning(
-                        f"Empty session {existing.id} workspace missing in sandbox "
-                        f"{sandbox.id}. Deleting and creating fresh session."
+                        "Empty session %s workspace missing in sandbox %s. Deleting and creating fresh session.",
+                        existing.id,
+                        sandbox.id,
                     )
             else:
                 logger.warning(
-                    f"Empty session {existing.id} has no active sandbox "
-                    f"(sandbox={'missing' if not sandbox else sandbox.status}). "
-                    f"Deleting and creating fresh session."
+                    "Empty session %s has no active sandbox (sandbox=%s). Deleting and creating fresh session.",
+                    existing.id,
+                    "missing" if not sandbox else sandbox.status,
                 )
 
             # Delete the stale empty session - create_session__no_commit will
@@ -678,18 +909,16 @@ class SessionManager:
 
         return self.create_session__no_commit(
             user_id=user_id,
-            user_work_area=user_work_area,
-            user_level=user_level,
             llm_provider_type=llm_provider_type,
             llm_model_name=llm_model_name,
-            demo_data_enabled=demo_data_enabled,
+            headless=headless,
         )
 
     def delete_empty_session(self, user_id: UUID) -> bool:
         """Delete user's pre-provisioned (empty) session if one exists.
 
         A session is considered "empty" if it has no messages.
-        This is called when user changes LLM selection or toggles demo data
+        This is called when user changes LLM selection
         so the session can be re-created with the new LLM configuration.
 
         Args:
@@ -701,7 +930,7 @@ class SessionManager:
         empty_session = get_empty_session_for_user(user_id, self._db_session)
 
         if not empty_session:
-            logger.info(f"No empty session found for user {user_id}")
+            logger.info("No empty session found for user %s", user_id)
             return False
 
         session_id = empty_session.id
@@ -716,15 +945,19 @@ class SessionManager:
                     nextjs_port=empty_session.nextjs_port,
                 )
                 logger.info(
-                    f"Cleaned up session workspace {session_id} in sandbox {sandbox.id}"
+                    "Cleaned up session workspace %s in sandbox %s",
+                    session_id,
+                    sandbox.id,
                 )
             except Exception as e:
                 # Log but don't fail - session can still be deleted
-                logger.warning(f"Failed to cleanup session workspace {session_id}: {e}")
+                logger.warning(
+                    "Failed to cleanup session workspace %s: %s", session_id, e
+                )
 
         # Delete session (cascade deletes artifacts)
         delete_build_session__no_commit(session_id, user_id, self._db_session)
-        logger.info(f"Deleted empty session {session_id} for user {user_id}")
+        logger.info("Deleted empty session %s for user %s", session_id, user_id)
 
         return True
 
@@ -858,7 +1091,7 @@ class SessionManager:
             ):
                 with llm_generation_span(
                     llm=llm,
-                    flow="build_session_naming",
+                    flow=LLMFlow.BUILD_SESSION_NAMING,
                     input_messages=prompt_messages,
                 ) as span_generation:
                     response = llm.invoke(
@@ -877,129 +1110,9 @@ class SessionManager:
                 else f"Build Session {str(session_id)[:8]}"
             )
         except Exception as e:
-            logger.warning(f"Failed to generate session name with LLM: {e}")
+            logger.warning("Failed to generate session name with LLM: %s", e)
             # Fallback to simple truncation
             return user_message[:40].strip() + ("..." if len(user_message) > 40 else "")
-
-    def generate_followup_suggestions(
-        self,
-        user_message: str,
-        assistant_message: str,
-    ) -> list[dict[str, str]]:
-        """
-        Generate follow-up suggestions based on the first exchange.
-
-        Args:
-            user_message: The first user message content
-            assistant_message: The first assistant response (text only, no tool calls)
-
-        Returns:
-            List of suggestion dicts with "theme" and "text" keys, or empty list on failure
-        """
-        if not user_message or not assistant_message:
-            return []
-
-        try:
-            llm = get_default_llm()
-            prompt_messages: LanguageModelInput = [
-                SystemMessage(content=FOLLOWUP_SUGGESTIONS_SYSTEM_PROMPT),
-                UserMessage(
-                    content=FOLLOWUP_SUGGESTIONS_USER_PROMPT.format(
-                        user_message=user_message[:1000],  # Limit input size
-                        assistant_message=assistant_message[:2000],
-                    )
-                ),
-            ]
-            # Call LLM with Braintrust tracing
-            with ensure_trace("build_followup_suggestions"):
-                with llm_generation_span(
-                    llm=llm,
-                    flow="build_followup_suggestions",
-                    input_messages=prompt_messages,
-                ) as span_generation:
-                    response = llm.invoke(
-                        prompt_messages,
-                        reasoning_effort=ReasoningEffort.OFF,
-                        max_tokens=500,
-                    )
-                    record_llm_response(span_generation, response)
-                    raw_output = llm_response_to_string(response).strip()
-
-            return self._parse_suggestions(raw_output)
-        except Exception as e:
-            logger.warning(f"Failed to generate follow-up suggestions with LLM: {e}")
-            return []
-
-    def _parse_suggestions(self, raw_output: str) -> list[dict[str, str]]:
-        """
-        Parse suggestions from LLM output with multiple fallback strategies.
-
-        Args:
-            raw_output: Raw LLM response string
-
-        Returns:
-            List of suggestion dicts or empty list on parse failure
-        """
-        import re
-
-        # Strategy 1: Try direct JSON parse
-        try:
-            # Strip common LLM artifacts (code fences, etc.)
-            cleaned = raw_output.strip()
-            if cleaned.startswith("```"):
-                # Extract content between code fences
-                parts = cleaned.split("```")
-                if len(parts) >= 2:
-                    cleaned = parts[1]
-                    if cleaned.startswith("json"):
-                        cleaned = cleaned[4:]
-                    cleaned = cleaned.strip()
-
-            data = json.loads(cleaned)
-            if isinstance(data, list) and len(data) >= 2:
-                suggestions = []
-                for item in data[:2]:
-                    if isinstance(item, dict) and "theme" in item and "text" in item:
-                        theme = item["theme"].lower()
-                        if theme in ("add", "question"):
-                            text = str(item["text"])[:150]  # Truncate to max length
-                            suggestions.append({"theme": theme, "text": text})
-                if len(suggestions) == 2:
-                    return suggestions
-        except (json.JSONDecodeError, KeyError, TypeError):
-            pass
-
-        # Strategy 2: Regex extraction for common patterns
-        # Handles: "theme": "add", "text": "..." patterns
-        suggestions = []
-        for theme in ["add", "question"]:
-            # Match "theme": "add" followed by "text": "..."
-            pattern = rf'"theme"\s*:\s*"{theme}"[^}}]*"text"\s*:\s*"([^"]+)"'
-            match = re.search(pattern, raw_output, re.IGNORECASE | re.DOTALL)
-            if match:
-                text = match.group(1)[:150]
-                suggestions.append({"theme": theme, "text": text})
-
-        if len(suggestions) == 2:
-            return suggestions
-
-        # Strategy 3: Alternative pattern - theme and text in any order
-        suggestions = []
-        for theme in ["add", "question"]:
-            pattern = rf'"text"\s*:\s*"([^"]+)"[^}}]*"theme"\s*:\s*"{theme}"'
-            match = re.search(pattern, raw_output, re.IGNORECASE | re.DOTALL)
-            if match:
-                text = match.group(1)[:150]
-                suggestions.append({"theme": theme, "text": text})
-
-        if len(suggestions) == 2:
-            return suggestions
-
-        # Silent fail - return empty list
-        logger.warning(
-            f"Failed to parse suggestions from LLM output: {raw_output[:200]}"
-        )
-        return []
 
     def delete_session(
         self,
@@ -1037,28 +1150,29 @@ class SessionManager:
                     nextjs_port=session.nextjs_port,
                 )
                 logger.info(
-                    f"Cleaned up session workspace {session_id} in sandbox {sandbox.id}"
+                    "Cleaned up session workspace %s in sandbox %s",
+                    session_id,
+                    sandbox.id,
                 )
             except Exception as e:
                 # Log but don't fail - session can still be deleted even if
                 # workspace cleanup fails (e.g., if pod is already terminated)
-                logger.warning(f"Failed to cleanup session workspace {session_id}: {e}")
+                logger.warning(
+                    "Failed to cleanup session workspace %s: %s", session_id, e
+                )
 
         # Delete snapshot files from S3 before removing DB records
         snapshots = get_snapshots_for_session(self._db_session, session_id)
         if snapshots:
-            from onyx.file_store.file_store import get_default_file_store
-            from onyx.server.features.build.sandbox.manager.snapshot_manager import (
-                SnapshotManager,
-            )
-
             snapshot_manager = SnapshotManager(get_default_file_store())
             for snapshot in snapshots:
                 try:
                     snapshot_manager.delete_snapshot(snapshot.storage_path)
                 except Exception as e:
                     logger.warning(
-                        f"Failed to delete snapshot file {snapshot.storage_path}: {e}"
+                        "Failed to delete snapshot file %s: %s",
+                        snapshot.storage_path,
+                        e,
                     )
 
         # Delete session (uses flush, caller commits)
@@ -1110,6 +1224,417 @@ class SessionManager:
         """
         yield from self._stream_cli_agent_response(session_id, content, user_id)
 
+    # ----- Persistence helpers (shared with the headless scheduled-tasks executor) -----
+    #
+    # `_yield_sandbox_events` is a thin wrapper around the sandbox manager that drives
+    # the agent to completion and yields raw sandbox events. It does NO database
+    # writes, no SSE formatting — making it composable: the SSE endpoint wraps
+    # it with `_persist_sandbox_event` + an SSE formatter, and the headless
+    # scheduled-tasks executor reuses `_persist_sandbox_event` directly so the
+    # persisted transcript is identical to an interactive run.
+
+    @staticmethod
+    def _extract_text_from_content(content: Any) -> str:
+        """Extract text from event content structure."""
+        if content is None:
+            return ""
+        if hasattr(content, "type") and content.type == "text":
+            return getattr(content, "text", "") or ""
+        if isinstance(content, list):
+            texts = []
+            for block in content:
+                if hasattr(block, "type") and block.type == "text":
+                    texts.append(getattr(block, "text", "") or "")
+            return "".join(texts)
+        return ""
+
+    @staticmethod
+    def _serialize_sandbox_event(event: Any, event_type: str) -> str:
+        """Serialize a sandbox event to SSE format, preserving all fields."""
+        if hasattr(event, "model_dump"):
+            data = event.model_dump(mode="json", by_alias=True, exclude_none=False)
+        else:
+            data = {"raw": str(event)}
+
+        data["type"] = event_type
+        data["timestamp"] = datetime.now(tz=timezone.utc).isoformat()
+
+        return f"event: message\ndata: {json.dumps(data)}\n\n"
+
+    @staticmethod
+    def _format_packet_event(packet: BuildPacket) -> str:
+        """Format a BuildPacket as SSE."""
+        return f"event: message\ndata: {packet.model_dump_json(by_alias=True)}\n\n"
+
+    @staticmethod
+    def _merge_events_with_announces(
+        event_iter: Generator[Any, None, None],
+        session_id: UUID,
+        tenant_id: str,
+    ) -> Generator[Any, None, None]:
+        """Merge sandbox events and approval announces into one stream.
+
+        Two producer threads feed a shared queue: the sandbox-event iterator, and a
+        BLPOP poller that emits `ApprovalRequestedPacket` when the proxy
+        signals a new approval. Announce latency is bounded by the 1s BLPOP.
+        """
+        output: queue_lib.Queue[Any] = queue_lib.Queue()
+        stop = threading.Event()
+        done_sentinel = object()
+
+        def drive_events() -> None:
+            try:
+                for evt in event_iter:
+                    output.put(evt)
+            except Exception as e:
+                output.put(e)
+            finally:
+                output.put(done_sentinel)
+
+        def drive_announces() -> None:
+            cache = get_cache_backend(tenant_id=tenant_id)
+            while not stop.is_set():
+                try:
+                    approval_id = approval_cache.pop_announcement(
+                        session_id, timeout_s=1, cache=cache
+                    )
+                except Exception:
+                    logger.exception(
+                        "approval.announce_poll_failed session_id=%s", session_id
+                    )
+                    time.sleep(1)
+                    continue
+                if approval_id is None:
+                    continue
+                output.put(
+                    ApprovalRequestedPacket(
+                        approval_id=approval_id, session_id=session_id
+                    )
+                )
+
+        events_thread = threading.Thread(
+            target=drive_events, name=f"events-pump-{session_id}", daemon=True
+        )
+        announce_thread = threading.Thread(
+            target=drive_announces,
+            name=f"announce-pump-{session_id}",
+            daemon=True,
+        )
+        events_thread.start()
+        announce_thread.start()
+        try:
+            while True:
+                item = output.get()
+                if item is done_sentinel:
+                    return
+                if isinstance(item, Exception):
+                    raise item
+                yield item
+        finally:
+            stop.set()
+
+    def _save_pending_chunks(
+        self,
+        session_id: UUID,
+        state: BuildStreamingState,
+    ) -> None:
+        """Flush any pending accumulated message/thought chunks to the DB.
+
+        Called when the next sandbox event is of a different type than the chunks
+        currently being accumulated, and once more at end of stream.
+        """
+        message_packet = state.finalize_message_chunks()
+        if message_packet:
+            create_message(
+                session_id=session_id,
+                message_type=MessageType.ASSISTANT,
+                turn_index=state.turn_index,
+                message_metadata=message_packet,
+                db_session=self._db_session,
+            )
+
+        thought_packet = state.finalize_thought_chunks()
+        if thought_packet:
+            create_message(
+                session_id=session_id,
+                message_type=MessageType.ASSISTANT,
+                turn_index=state.turn_index,
+                message_metadata=thought_packet,
+                db_session=self._db_session,
+            )
+
+        state.clear_last_chunk_type()
+
+    def _yield_sandbox_events(
+        self,
+        sandbox_id: UUID,
+        session_id: UUID,
+        user_message_content: str,
+    ) -> Generator[Any, None, None]:
+        """Drain the CLI agent to completion, yielding raw sandbox events.
+
+        Pure sandbox-event generator — minimal DB work (one preflight on first
+        message to resolve+persist the opencode session id). No SSE
+        formatting. Callers compose this with `_persist_sandbox_event` (to
+        apply persistence side effects) and, in the SSE case, an SSE
+        serializer.
+
+        The events include `SSEKeepalive` markers from the sandbox client;
+        callers should pass them through (interactive) or drop them
+        (headless).
+        """
+        opencode_session_id = self._ensure_opencode_session_id(sandbox_id, session_id)
+        agent_provider, agent_model = self._get_session_agent_selection(session_id)
+
+        def _persist_resolved_id(new_id: str) -> None:
+            # Pod restart / eviction / 404 → the persisted opencode_session_id
+            # was stale and the transport had to mint a new one. Write the
+            # new id back so the next turn doesn't 404 the same stale id
+            # and orphan another fresh opencode session (which would drop
+            # the conversation history).
+            self._persist_opencode_session_id(session_id, new_id)
+
+        yield from self._sandbox_manager.send_message(
+            sandbox_id,
+            session_id,
+            user_message_content,
+            opencode_session_id=opencode_session_id,
+            agent_provider=agent_provider,
+            agent_model=agent_model,
+            on_opencode_session_resolved=_persist_resolved_id,
+        )
+
+    def _get_session_agent_selection(
+        self, session_id: UUID
+    ) -> tuple[str | None, str | None]:
+        """``(agent_provider, agent_model)`` from the BuildSession row;
+        ``(None, None)`` for pre-migration rows."""
+        row = (
+            self._db_session.query(BuildSession)
+            .filter(BuildSession.id == session_id)
+            .first()
+        )
+        if row is None:
+            return None, None
+        return row.agent_provider, row.agent_model
+
+    def _ensure_opencode_session_id(
+        self,
+        sandbox_id: UUID,
+        session_id: UUID,
+    ) -> str | None:
+        """Return BuildSession.opencode_session_id; lazily populate on
+        first turn."""
+        build_session = (
+            self._db_session.query(BuildSession)
+            .filter(BuildSession.id == session_id)
+            .first()
+        )
+        if build_session is None:
+            logger.warning(
+                "[SESSION-LIFECYCLE] preflight: BuildSession %s not found",
+                session_id,
+            )
+            return None
+        if build_session.opencode_session_id:
+            logger.info(
+                "[SESSION-LIFECYCLE] preflight: reusing persisted opencode_session_id=%s "
+                "for build_session=%s (no DB write, no /session call)",
+                build_session.opencode_session_id,
+                session_id,
+            )
+            return build_session.opencode_session_id
+
+        logger.info(
+            "[SESSION-LIFECYCLE] preflight: BuildSession %s has no opencode_session_id; "
+            "calling sandbox_manager.ensure_opencode_session",
+            session_id,
+        )
+        new_id = self._sandbox_manager.ensure_opencode_session(sandbox_id, session_id)
+        if new_id is None:
+            # Sandbox manager declined (shouldn't happen in serve mode).
+            logger.warning(
+                "[SESSION-LIFECYCLE] preflight: ensure_opencode_session returned None "
+                "for build_session=%s; returning None",
+                session_id,
+            )
+            return None
+        build_session.opencode_session_id = new_id
+        self._db_session.commit()
+        logger.info(
+            "[SESSION-LIFECYCLE] preflight: persisted new opencode_session_id=%s "
+            "for build_session=%s (first-turn create)",
+            new_id,
+            session_id,
+        )
+        return new_id
+
+    def _persist_opencode_session_id(self, session_id: UUID, new_id: str) -> None:
+        """Write a freshly-resolved opencode_session_id back to the
+        BuildSession row. Called from the transport's
+        ``on_opencode_session_resolved`` callback when the persisted id
+        was stale (404) or absent."""
+        build_session = (
+            self._db_session.query(BuildSession)
+            .filter(BuildSession.id == session_id)
+            .first()
+        )
+        if build_session is None:
+            logger.warning(
+                "[SESSION-LIFECYCLE] callback: BuildSession %s vanished before "
+                "we could persist new opencode_session_id=%s",
+                session_id,
+                new_id,
+            )
+            return
+        if build_session.opencode_session_id == new_id:
+            logger.info(
+                "[SESSION-LIFECYCLE] callback: opencode_session_id=%s already "
+                "matches DB for build_session=%s; no-op",
+                new_id,
+                session_id,
+            )
+            return
+        old_id = build_session.opencode_session_id
+        build_session.opencode_session_id = new_id
+        self._db_session.commit()
+        logger.warning(
+            "[SESSION-LIFECYCLE] callback: rewrote opencode_session_id %s -> %s "
+            "for build_session=%s (stale id replaced)",
+            old_id,
+            new_id,
+            session_id,
+        )
+
+    def _persist_sandbox_event(
+        self,
+        session_id: UUID,
+        state: BuildStreamingState,
+        sandbox_event: Any,
+    ) -> None:
+        """Apply persistence side effects for a single sandbox event.
+
+        This is the persistence half of the old `_stream_cli_agent_response`
+        method. It is intentionally synchronous and free of SSE / logging
+        concerns so the headless scheduled-tasks executor can reuse it byte-
+        for-byte against the same `BuildStreamingState` the interactive path
+        uses.
+
+        Behavior matches the pre-refactor interactive path exactly:
+        - SSEKeepalive: no-op (handled by callers).
+        - agent_message_chunk / agent_thought_chunk: accumulated; flushed
+          when a non-chunk event arrives or at end of stream.
+        - tool_call_start: no-op (only completed tool calls persist).
+        - tool_call_progress: TodoWrite saves every progress update; other
+          tools save only on `status == "completed"`. Completed Task
+          sub-agent calls also emit a synthetic agent_message containing
+          the task output.
+        - agent_plan_update: upserted (only the latest plan per turn).
+        - current_mode_update / prompt_response / error / unrecognized: not
+          persisted by the interactive path; preserved here for parity.
+        """
+        if isinstance(sandbox_event, SSEKeepalive):
+            return
+
+        # Flush any pending chunks if the event type changed.
+        event_type = self._get_event_type(sandbox_event)
+        if state.should_finalize_chunks(event_type):
+            self._save_pending_chunks(session_id, state)
+
+        if isinstance(sandbox_event, AgentMessageChunk):
+            text = self._extract_text_from_content(sandbox_event.content)
+            if text:
+                state.add_message_chunk(text)
+            return
+
+        if isinstance(sandbox_event, AgentThoughtChunk):
+            text = self._extract_text_from_content(sandbox_event.content)
+            if text:
+                state.add_thought_chunk(text)
+            return
+
+        if isinstance(sandbox_event, ToolCallStart):
+            # Stream-only; persistence happens on `completed` progress.
+            return
+
+        if isinstance(sandbox_event, ToolCallProgress):
+            event_data = sandbox_event.model_dump(
+                mode="json", by_alias=True, exclude_none=False
+            )
+            event_data["type"] = "tool_call_progress"
+            event_data["timestamp"] = datetime.now(tz=timezone.utc).isoformat()
+
+            tool_name = (event_data.get("title") or "").lower()
+            is_todo_write = tool_name in ("todowrite", "todo_write")
+
+            raw_input = event_data.get("rawInput") or {}
+            is_task_tool = (
+                tool_name == "task"
+                or raw_input.get("subagent_type") is not None
+                or raw_input.get("subagentType") is not None
+            )
+
+            if is_todo_write or sandbox_event.status == "completed":
+                create_message(
+                    session_id=session_id,
+                    message_type=MessageType.ASSISTANT,
+                    turn_index=state.turn_index,
+                    message_metadata=event_data,
+                    db_session=self._db_session,
+                )
+
+            if is_task_tool and sandbox_event.status == "completed":
+                raw_output = event_data.get("rawOutput") or {}
+                task_output = raw_output.get("output")
+                if task_output and isinstance(task_output, str):
+                    metadata_idx = task_output.find("<task_metadata>")
+                    if metadata_idx >= 0:
+                        task_output = task_output[:metadata_idx].strip()
+
+                    if task_output:
+                        task_output_packet = {
+                            "type": "agent_message",
+                            "content": {"type": "text", "text": task_output},
+                            "source": "task_output",
+                            "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                        }
+                        create_message(
+                            session_id=session_id,
+                            message_type=MessageType.ASSISTANT,
+                            turn_index=state.turn_index,
+                            message_metadata=task_output_packet,
+                            db_session=self._db_session,
+                        )
+            return
+
+        if isinstance(sandbox_event, AgentPlanUpdate):
+            event_data = sandbox_event.model_dump(
+                mode="json", by_alias=True, exclude_none=False
+            )
+            event_data["type"] = "agent_plan_update"
+            event_data["timestamp"] = datetime.now(tz=timezone.utc).isoformat()
+            plan_msg = upsert_agent_plan(
+                session_id=session_id,
+                turn_index=state.turn_index,
+                plan_metadata=event_data,
+                db_session=self._db_session,
+                existing_plan_id=state.plan_message_id,
+            )
+            state.plan_message_id = plan_msg.id
+            return
+
+        # CurrentModeUpdate, PromptResponse, SandboxError, and unrecognized
+        # packets are not persisted (parity with prior behavior).
+        return
+
+    def _finalize_persist(
+        self,
+        session_id: UUID,
+        state: BuildStreamingState,
+    ) -> None:
+        """End-of-stream persistence hook. Flushes any pending chunks."""
+        self._save_pending_chunks(session_id, state)
+
     def _stream_cli_agent_response(
         self,
         session_id: UUID,
@@ -1132,70 +1657,6 @@ class SessionManager:
         - agent_plan_update: Upserted (only latest plan kept per turn)
         """
 
-        def _serialize_acp_event(event: Any, event_type: str) -> str:
-            """Serialize an ACP event to SSE format, preserving ALL ACP data."""
-            if hasattr(event, "model_dump"):
-                data = event.model_dump(mode="json", by_alias=True, exclude_none=False)
-            else:
-                data = {"raw": str(event)}
-
-            data["type"] = event_type
-            data["timestamp"] = datetime.now(tz=timezone.utc).isoformat()
-
-            return f"event: message\ndata: {json.dumps(data)}\n\n"
-
-        def _format_packet_event(packet: BuildPacket) -> str:
-            """Format a BuildPacket as SSE."""
-            return f"event: message\ndata: {packet.model_dump_json(by_alias=True)}\n\n"
-
-        def _extract_text_from_content(content: Any) -> str:
-            """Extract text from ACP content structure."""
-            if content is None:
-                return ""
-            if hasattr(content, "type") and content.type == "text":
-                return getattr(content, "text", "") or ""
-            if isinstance(content, list):
-                texts = []
-                for block in content:
-                    if hasattr(block, "type") and block.type == "text":
-                        texts.append(getattr(block, "text", "") or "")
-                return "".join(texts)
-            return ""
-
-        def _save_pending_chunks(state: BuildStreamingState) -> None:
-            """Save any pending accumulated chunks to the database."""
-            # Finalize message chunks
-            message_packet = state.finalize_message_chunks()
-            if message_packet:
-                create_message(
-                    session_id=session_id,
-                    message_type=MessageType.ASSISTANT,
-                    turn_index=state.turn_index,
-                    message_metadata=message_packet,
-                    db_session=self._db_session,
-                )
-
-            # Finalize thought chunks
-            thought_packet = state.finalize_thought_chunks()
-            if thought_packet:
-                create_message(
-                    session_id=session_id,
-                    message_type=MessageType.ASSISTANT,
-                    turn_index=state.turn_index,
-                    message_metadata=thought_packet,
-                    db_session=self._db_session,
-                )
-
-            state.clear_last_chunk_type()
-
-        def _save_build_turn(state: BuildStreamingState) -> None:
-            """Save all accumulated state at the end of streaming.
-
-            Similar to save_chat_turn() in the main chat flow.
-            """
-            # 1. Save any remaining accumulated chunks
-            _save_pending_chunks(state)
-
         # Initialize packet logging
         packet_logger = get_packet_logger()
 
@@ -1214,13 +1675,18 @@ class SessionManager:
             },
         )
 
+        events_emitted = 0
+        state = BuildStreamingState(turn_index=0)
+        # Set inside the SERVE-transport block below; released in finally.
+        prompt_slot_cm: contextlib.AbstractContextManager[bool] | None = None
+
         try:
             # Verify session exists and belongs to user
             session = get_build_session(session_id, user_id, self._db_session)
             if session is None:
                 error_packet = ErrorPacket(message="Session not found")
                 packet_logger.log("error", error_packet.model_dump())
-                yield _format_packet_event(error_packet)
+                yield self._format_packet_event(error_packet)
                 return
 
             # Get the user's sandbox (now user-owned, not session-owned)
@@ -1232,11 +1698,46 @@ class SessionManager:
                     message="Sandbox is not running. Please wait for it to start."
                 )
                 packet_logger.log("error", error_packet.model_dump())
-                yield _format_packet_event(error_packet)
+                yield self._format_packet_event(error_packet)
                 return
 
             # Update last activity timestamp
             update_session_activity(session_id, self._db_session)
+
+            # Acquire a per-build-session lock BEFORE we touch the opencode
+            # session id (preflight + persist + transport). Keying on
+            # build_session_id (not opencode_session_id) is deliberate:
+            # the opencode id can rotate mid-turn via the
+            # on_opencode_session_resolved callback, so a key based on it
+            # would let a concurrent request acquire a DIFFERENT lock and
+            # bypass serialization on exactly the recovery path. It also
+            # blocks first-turn races where two simultaneous prompts on a
+            # fresh build session would each mint their own opencode
+            # session. See SandboxManager.prompt_slot for the full
+            # rationale.
+            #
+            # The slot is released in the matching `finally` at the
+            # bottom of this try/except block.
+            candidate_cm = self._sandbox_manager.prompt_slot(sandbox.id, session_id)
+            if not candidate_cm.__enter__():
+                # Release the no-op exit so the context manager's
+                # contract is respected, then surface a clean error
+                # without persisting any user_message or contacting
+                # opencode.
+                candidate_cm.__exit__(None, None, None)
+                error_packet = ErrorPacket(
+                    message=(
+                        "This session is busy with a previous turn. "
+                        "Please wait for it to finish before sending "
+                        "another message."
+                    )
+                )
+                packet_logger.log("error", error_packet.model_dump())
+                yield self._format_packet_event(error_packet)
+                return
+            # Slot acquired — hand off ownership to the outer finally,
+            # which releases on every exit path.
+            prompt_slot_cm = candidate_cm
 
             # Calculate turn_index BEFORE saving user message
             # turn_index = count of existing USER messages (this will be the Nth user message)
@@ -1273,7 +1774,7 @@ class SessionManager:
             if sandbox is None:
                 error_packet = ErrorPacket(message="Sandbox not found")
                 packet_logger.log("error", error_packet.model_dump())
-                yield _format_packet_event(error_packet)
+                yield self._format_packet_event(error_packet)
                 return
 
             sandbox_id = sandbox.id
@@ -1288,175 +1789,130 @@ class SessionManager:
                 },
             )
 
-            # Stream ACP events directly to frontend
-            for acp_event in self._sandbox_manager.send_message(
-                sandbox_id, session_id, user_message_content
-            ):
-                # Handle SSE keepalive - send comment to keep connection alive
-                if isinstance(acp_event, SSEKeepalive):
+            # Drive the agent. sandbox events are merged with proxy approval
+            # announces onto one SSE stream. `_persist_sandbox_event` applies
+            # persistence; SSE formatting + packet-logger book-keeping happen here.
+            merged_events = self._merge_events_with_announces(
+                self._yield_sandbox_events(
+                    sandbox_id, session_id, user_message_content
+                ),
+                session_id=session_id,
+                tenant_id=get_current_tenant_id(),
+            )
+            for sandbox_event in merged_events:
+                if isinstance(sandbox_event, ApprovalRequestedPacket):
+                    packet_logger.log(
+                        "approval_requested",
+                        sandbox_event.model_dump(mode="json"),
+                    )
+                    packet_logger.log_sse_emit("approval_requested", session_id)
+                    yield self._format_packet_event(sandbox_event)
+                    continue
+
+                # Handle SSE keepalive - send comment to keep connection alive.
+                if isinstance(sandbox_event, SSEKeepalive):
                     # SSE comments start with : and are ignored by EventSource
-                    # but keep the HTTP connection alive
+                    # but keep the HTTP connection alive.
                     packet_logger.log_sse_emit("keepalive", session_id)
                     yield ": keepalive\n\n"
                     continue
 
-                # Check if we need to finalize pending chunks before processing
-                event_type = self._get_event_type(acp_event)
-                if state.should_finalize_chunks(event_type):
-                    _save_pending_chunks(state)
-
+                # Persistence first so DB writes precede the SSE emit (matches
+                # the prior in-loop ordering, which interleaved them).
+                self._persist_sandbox_event(session_id, state, sandbox_event)
                 events_emitted += 1
 
-                # Pass through ACP events with snake_case type names
-                if isinstance(acp_event, AgentMessageChunk):
-                    text = _extract_text_from_content(acp_event.content)
-                    if text:
-                        state.add_message_chunk(text)
-                    event_data = acp_event.model_dump(
+                # SSE-only branches: log + serialize for the HTTP client.
+                if isinstance(sandbox_event, AgentMessageChunk):
+                    event_data = sandbox_event.model_dump(
                         mode="json", by_alias=True, exclude_none=False
                     )
                     event_data["type"] = "agent_message_chunk"
                     packet_logger.log("agent_message_chunk", event_data)
                     packet_logger.log_sse_emit("agent_message_chunk", session_id)
-                    yield _serialize_acp_event(acp_event, "agent_message_chunk")
+                    yield self._serialize_sandbox_event(
+                        sandbox_event, "agent_message_chunk"
+                    )
 
-                elif isinstance(acp_event, AgentThoughtChunk):
-                    text = _extract_text_from_content(acp_event.content)
-                    if text:
-                        state.add_thought_chunk(text)
+                elif isinstance(sandbox_event, AgentThoughtChunk):
                     packet_logger.log(
                         "agent_thought_chunk",
-                        acp_event.model_dump(mode="json", by_alias=True),
+                        sandbox_event.model_dump(mode="json", by_alias=True),
                     )
                     packet_logger.log_sse_emit("agent_thought_chunk", session_id)
-                    yield _serialize_acp_event(acp_event, "agent_thought_chunk")
+                    yield self._serialize_sandbox_event(
+                        sandbox_event, "agent_thought_chunk"
+                    )
 
-                elif isinstance(acp_event, ToolCallStart):
-                    # Stream to frontend but don't save - wait for completion
+                elif isinstance(sandbox_event, ToolCallStart):
                     packet_logger.log(
                         "tool_call_start",
-                        acp_event.model_dump(mode="json", by_alias=True),
+                        sandbox_event.model_dump(mode="json", by_alias=True),
                     )
                     packet_logger.log_sse_emit("tool_call_start", session_id)
-                    yield _serialize_acp_event(acp_event, "tool_call_start")
+                    yield self._serialize_sandbox_event(
+                        sandbox_event, "tool_call_start"
+                    )
 
-                elif isinstance(acp_event, ToolCallProgress):
-                    event_data = acp_event.model_dump(
+                elif isinstance(sandbox_event, ToolCallProgress):
+                    event_data = sandbox_event.model_dump(
                         mode="json", by_alias=True, exclude_none=False
                     )
                     event_data["type"] = "tool_call_progress"
                     event_data["timestamp"] = datetime.now(tz=timezone.utc).isoformat()
-
-                    # Check if this is a TodoWrite tool call
-                    tool_name = (event_data.get("title") or "").lower()
-                    is_todo_write = tool_name in ("todowrite", "todo_write")
-
-                    # Check if this is a Task (subagent) tool call
-                    raw_input = event_data.get("rawInput") or {}
-                    is_task_tool = (
-                        tool_name == "task"
-                        or raw_input.get("subagent_type") is not None
-                        or raw_input.get("subagentType") is not None
-                    )
-
-                    # Save to DB:
-                    # - For TodoWrite: Save every progress update (todos change frequently)
-                    # - For other tools: Only save when status="completed"
-                    if is_todo_write or acp_event.status == "completed":
-                        create_message(
-                            session_id=session_id,
-                            message_type=MessageType.ASSISTANT,
-                            turn_index=state.turn_index,
-                            message_metadata=event_data,
-                            db_session=self._db_session,
-                        )
-
-                    # For completed Task tools, also save the output as an agent_message
-                    # This allows the task output to be rendered as assistant text on reload
-                    if is_task_tool and acp_event.status == "completed":
-                        raw_output = event_data.get("rawOutput") or {}
-                        task_output = raw_output.get("output")
-                        if task_output and isinstance(task_output, str):
-                            # Strip task_metadata from the output
-                            metadata_idx = task_output.find("<task_metadata>")
-                            if metadata_idx >= 0:
-                                task_output = task_output[:metadata_idx].strip()
-
-                            if task_output:
-                                # Create agent_message packet for the task output
-                                task_output_packet = {
-                                    "type": "agent_message",
-                                    "content": {"type": "text", "text": task_output},
-                                    "source": "task_output",
-                                    "timestamp": datetime.now(
-                                        tz=timezone.utc
-                                    ).isoformat(),
-                                }
-                                create_message(
-                                    session_id=session_id,
-                                    message_type=MessageType.ASSISTANT,
-                                    turn_index=state.turn_index,
-                                    message_metadata=task_output_packet,
-                                    db_session=self._db_session,
-                                )
-
-                    # Log full event to packet logger (can handle large payloads)
                     packet_logger.log("tool_call_progress", event_data)
                     packet_logger.log_sse_emit("tool_call_progress", session_id)
-                    yield _serialize_acp_event(acp_event, "tool_call_progress")
+                    yield self._serialize_sandbox_event(
+                        sandbox_event, "tool_call_progress"
+                    )
 
-                elif isinstance(acp_event, AgentPlanUpdate):
-                    event_data = acp_event.model_dump(
+                elif isinstance(sandbox_event, AgentPlanUpdate):
+                    event_data = sandbox_event.model_dump(
                         mode="json", by_alias=True, exclude_none=False
                     )
                     event_data["type"] = "agent_plan_update"
                     event_data["timestamp"] = datetime.now(tz=timezone.utc).isoformat()
-
-                    # Upsert plan immediately
-                    plan_msg = upsert_agent_plan(
-                        session_id=session_id,
-                        turn_index=state.turn_index,
-                        plan_metadata=event_data,
-                        db_session=self._db_session,
-                        existing_plan_id=state.plan_message_id,
-                    )
-                    state.plan_message_id = plan_msg.id
-
                     packet_logger.log("agent_plan_update", event_data)
                     packet_logger.log_sse_emit("agent_plan_update", session_id)
-                    yield _serialize_acp_event(acp_event, "agent_plan_update")
+                    yield self._serialize_sandbox_event(
+                        sandbox_event, "agent_plan_update"
+                    )
 
-                elif isinstance(acp_event, CurrentModeUpdate):
-                    event_data = acp_event.model_dump(
+                elif isinstance(sandbox_event, CurrentModeUpdate):
+                    event_data = sandbox_event.model_dump(
                         mode="json", by_alias=True, exclude_none=False
                     )
                     event_data["type"] = "current_mode_update"
                     packet_logger.log("current_mode_update", event_data)
                     packet_logger.log_sse_emit("current_mode_update", session_id)
-                    yield _serialize_acp_event(acp_event, "current_mode_update")
+                    yield self._serialize_sandbox_event(
+                        sandbox_event, "current_mode_update"
+                    )
 
-                elif isinstance(acp_event, PromptResponse):
-                    event_data = acp_event.model_dump(
+                elif isinstance(sandbox_event, PromptResponse):
+                    event_data = sandbox_event.model_dump(
                         mode="json", by_alias=True, exclude_none=False
                     )
                     event_data["type"] = "prompt_response"
                     packet_logger.log("prompt_response", event_data)
                     packet_logger.log_sse_emit("prompt_response", session_id)
-                    yield _serialize_acp_event(acp_event, "prompt_response")
+                    yield self._serialize_sandbox_event(
+                        sandbox_event, "prompt_response"
+                    )
 
-                elif isinstance(acp_event, ACPError):
-                    event_data = acp_event.model_dump(
+                elif isinstance(sandbox_event, SandboxError):
+                    event_data = sandbox_event.model_dump(
                         mode="json", by_alias=True, exclude_none=False
                     )
                     event_data["type"] = "error"
                     packet_logger.log("error", event_data)
                     packet_logger.log_sse_emit("error", session_id)
-                    yield _serialize_acp_event(acp_event, "error")
+                    yield self._serialize_sandbox_event(sandbox_event, "error")
 
                 else:
-                    # Unrecognized packet type - log it but don't stream to frontend
-                    event_type_name = type(acp_event).__name__
-                    event_data = acp_event.model_dump(
+                    # Unrecognized packet type - log it but don't stream to frontend.
+                    event_type_name = type(sandbox_event).__name__
+                    event_data = sandbox_event.model_dump(
                         mode="json", by_alias=True, exclude_none=False
                     )
                     event_data["type"] = f"unrecognized_{event_type_name.lower()}"
@@ -1464,8 +1920,8 @@ class SessionManager:
                         f"unrecognized_{event_type_name.lower()}", event_data
                     )
 
-            # Save all accumulated state at end of streaming
-            _save_build_turn(state)
+            # Flush any pending accumulated chunks at end of stream.
+            self._finalize_persist(session_id, state)
 
             # Log streaming completion
             packet_logger.log_raw(
@@ -1483,6 +1939,15 @@ class SessionManager:
             # Update heartbeat after successful message exchange
             update_sandbox_heartbeat(self._db_session, sandbox_id)
 
+        except GeneratorExit:
+            logger.warning(
+                "Stream generator closed for session %s after %d events "
+                "(client disconnected mid-stream)",
+                session_id,
+                events_emitted,
+            )
+            self._finalize_persist(session_id, state)
+            return
         except ValueError as e:
             error_packet = ErrorPacket(message=str(e))
             packet_logger.log("error", error_packet.model_dump())
@@ -1495,7 +1960,7 @@ class SessionManager:
                 },
             )
             logger.exception("ValueError in build message streaming")
-            yield _format_packet_event(error_packet)
+            yield self._format_packet_event(error_packet)
         except RuntimeError as e:
             error_packet = ErrorPacket(message=str(e))
             packet_logger.log("error", error_packet.model_dump())
@@ -1507,8 +1972,8 @@ class SessionManager:
                     "error": str(e),
                 },
             )
-            logger.exception(f"RuntimeError in build message streaming: {e}")
-            yield _format_packet_event(error_packet)
+            logger.exception("RuntimeError in build message streaming: %s", e)
+            yield self._format_packet_event(error_packet)
         except Exception as e:
             error_packet = ErrorPacket(message=str(e))
             packet_logger.log("error", error_packet.model_dump())
@@ -1521,25 +1986,35 @@ class SessionManager:
                 },
             )
             logger.exception("Unexpected error in build message streaming")
-            yield _format_packet_event(error_packet)
+            yield self._format_packet_event(error_packet)
+        finally:
+            # Release the per-opencode-session lock acquired above (if any).
+            # Runs on every exit path including bare returns, GeneratorExit,
+            # and exception flow — without this a long-running turn would
+            # leak the lock and permanently block follow-up turns on the
+            # same session.
+            if prompt_slot_cm is not None:
+                prompt_slot_cm.__exit__(None, None, None)
 
-    def _get_event_type(self, acp_event: Any) -> str:
-        """Get the event type string for an ACP event."""
-        if isinstance(acp_event, AgentMessageChunk):
+    @staticmethod
+    def _get_event_type(sandbox_event: Any) -> str:
+        """SSE ``type`` string for a sandbox event. Sandbox-event schema classes
+        don't expose ``.type`` directly, so callers go through here."""
+        if isinstance(sandbox_event, AgentMessageChunk):
             return "agent_message_chunk"
-        elif isinstance(acp_event, AgentThoughtChunk):
+        elif isinstance(sandbox_event, AgentThoughtChunk):
             return "agent_thought_chunk"
-        elif isinstance(acp_event, ToolCallStart):
+        elif isinstance(sandbox_event, ToolCallStart):
             return "tool_call_start"
-        elif isinstance(acp_event, ToolCallProgress):
+        elif isinstance(sandbox_event, ToolCallProgress):
             return "tool_call_progress"
-        elif isinstance(acp_event, AgentPlanUpdate):
+        elif isinstance(sandbox_event, AgentPlanUpdate):
             return "agent_plan_update"
-        elif isinstance(acp_event, CurrentModeUpdate):
+        elif isinstance(sandbox_event, CurrentModeUpdate):
             return "current_mode_update"
-        elif isinstance(acp_event, PromptResponse):
+        elif isinstance(sandbox_event, PromptResponse):
             return "prompt_response"
-        elif isinstance(acp_event, ACPError):
+        elif isinstance(sandbox_event, SandboxError):
             return "error"
         return "unknown"
 
@@ -1564,8 +2039,6 @@ class SessionManager:
         Returns:
             List of artifact dicts or None if session not found or user doesn't own session
         """
-        import uuid
-
         # Verify session ownership
         session = get_build_session(session_id, user_id, self._db_session)
         if session is None:
@@ -1672,7 +2145,7 @@ class SessionManager:
         """
         Export a markdown file as DOCX.
 
-        Reads the markdown file and converts it to DOCX using pypandoc.
+        Reads the markdown file and converts it to DOCX.
 
         Args:
             session_id: The session UUID
@@ -1694,14 +2167,9 @@ class SessionManager:
         if not filename.lower().endswith(".md"):
             raise ValueError("Only markdown (.md) files can be exported as DOCX")
 
-        import tempfile
-        import pypandoc
-
         md_text = content_bytes.decode("utf-8")
 
-        with tempfile.NamedTemporaryFile(suffix=".docx", delete=True) as tmp:
-            pypandoc.convert_text(md_text, "docx", format="md", outputfile=tmp.name)
-            docx_bytes = tmp.read()
+        docx_bytes = markdown_to_docx_bytes(md_text)
 
         docx_filename = filename.rsplit(".", 1)[0] + ".docx"
         return (docx_bytes, docx_filename)
@@ -1730,8 +2198,6 @@ class SessionManager:
         Raises:
             ValueError: If path is invalid or conversion fails
         """
-        import hashlib
-
         # Verify session ownership
         session = get_build_session(session_id, user_id, self._db_session)
         if session is None:
@@ -1827,10 +2293,6 @@ class SessionManager:
         Returns True if the server responds with any status code, False on timeout
         or connection error.
         """
-        import httpx
-
-        from onyx.server.features.build.sandbox.base import get_sandbox_manager
-
         try:
             sandbox_manager = get_sandbox_manager()
             internal_url = sandbox_manager.get_webapp_url(sandbox_id, port)
@@ -2230,22 +2692,18 @@ class SessionManager:
         Returns:
             True if sandbox was terminated, False if user had no sandbox
         """
-        from onyx.server.features.build.db.sandbox import (
-            update_sandbox_status__no_commit,
-        )
-
         sandbox = get_sandbox_by_user_id(self._db_session, user_id)
         if sandbox is None:
             return False
 
         if sandbox.status == SandboxStatus.TERMINATED:
-            logger.info(f"Sandbox {sandbox.id} already terminated")
+            logger.info("Sandbox %s already terminated", sandbox.id)
             return True
 
         try:
             # Terminate the sandbox (this cleans up all resources)
             self._sandbox_manager.terminate(sandbox.id)
-            logger.info(f"Terminated sandbox {sandbox.id} for user {user_id}")
+            logger.info("Terminated sandbox %s for user %s", sandbox.id, user_id)
 
             # Update status in database
             update_sandbox_status__no_commit(
@@ -2256,5 +2714,5 @@ class SessionManager:
             return True
 
         except Exception as e:
-            logger.error(f"Failed to terminate sandbox {sandbox.id}: {e}")
+            logger.error("Failed to terminate sandbox %s: %s", sandbox.id, e)
             raise RuntimeError(f"Failed to terminate sandbox: {e}") from e

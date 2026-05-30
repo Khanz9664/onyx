@@ -1,77 +1,18 @@
 "use client";
 
 import { SvgCheckCircle } from "@opal/icons";
-import { cn } from "@/lib/utils";
+import { cn } from "@opal/utils";
 import { Disabled } from "@opal/core";
 import Text from "@/refresh-components/texts/Text";
 import { Tooltip } from "@opal/components";
-import { LLMProviderName, LLMProviderDescriptor } from "@/interfaces/llm";
+import { LLMProviderDescriptor } from "@/lib/languageModels/types";
+import {
+  BUILD_MODE_PROVIDERS as PROVIDERS,
+  type ProviderKey,
+} from "@/app/craft/onboarding/constants";
 
-// Provider configurations
-export type ProviderKey = "anthropic" | "openai" | "openrouter";
-
-interface ModelOption {
-  name: string;
-  label: string;
-  recommended?: boolean;
-}
-
-export interface ProviderConfig {
-  key: ProviderKey;
-  label: string;
-  providerName: LLMProviderName;
-  recommended?: boolean;
-  models: ModelOption[];
-  apiKeyPlaceholder: string;
-  apiKeyUrl: string;
-  apiKeyLabel: string;
-}
-
-export const PROVIDERS: ProviderConfig[] = [
-  {
-    key: "anthropic",
-    label: "Anthropic",
-    providerName: LLMProviderName.ANTHROPIC,
-    recommended: true,
-    models: [
-      { name: "claude-opus-4-7", label: "Claude Opus 4.7", recommended: true },
-      { name: "claude-opus-4-6", label: "Claude Opus 4.6" },
-      { name: "claude-sonnet-4-6", label: "Claude Sonnet 4.6" },
-    ],
-    apiKeyPlaceholder: "sk-ant-...",
-    apiKeyUrl: "https://console.anthropic.com/dashboard",
-    apiKeyLabel: "Anthropic Console",
-  },
-  {
-    key: "openai",
-    label: "OpenAI",
-    providerName: LLMProviderName.OPENAI,
-    models: [
-      { name: "gpt-5.2", label: "GPT-5.2", recommended: true },
-      { name: "gpt-5.1", label: "GPT-5.1" },
-    ],
-    apiKeyPlaceholder: "sk-...",
-    apiKeyUrl: "https://platform.openai.com/api-keys",
-    apiKeyLabel: "OpenAI Dashboard",
-  },
-  {
-    key: "openrouter",
-    label: "OpenRouter",
-    providerName: LLMProviderName.OPENROUTER,
-    models: [
-      {
-        name: "moonshotai/kimi-k2-thinking",
-        label: "Kimi K2 Thinking",
-        recommended: true,
-      },
-      { name: "google/gemini-3-pro-preview", label: "Gemini 3 Pro" },
-      { name: "qwen/qwen3-235b-a22b-thinking-2507", label: "Qwen3 235B" },
-    ],
-    apiKeyPlaceholder: "sk-or-...",
-    apiKeyUrl: "https://openrouter.ai/keys",
-    apiKeyLabel: "OpenRouter Dashboard",
-  },
-];
+export { PROVIDERS };
+export type { ProviderKey };
 
 interface SelectableButtonProps {
   selected: boolean;
@@ -300,11 +241,11 @@ export default function OnboardingLlmSetup({
               onChange={(e) => handleApiKeyChange(e.target.value)}
               placeholder={currentProviderConfig.apiKeyPlaceholder}
               disabled={connectionStatus === "testing"}
-              className="w-full px-3 py-2 rounded-08 input-normal text-text-04 placeholder:text-text-02 focus:outline-none"
+              className="w-full px-3 py-2 rounded-08 input-normal text-text-04 placeholder:text-text-02 focus:outline-hidden"
             />
           </Disabled>
           {/* Message area */}
-          <div className="min-h-[2rem] flex justify-center pt-4">
+          <div className="min-h-8 flex justify-center pt-4">
             {connectionStatus === "error" && (
               <Text secondaryBody className="text-red-500">
                 {errorMessage}

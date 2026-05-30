@@ -2,23 +2,13 @@
 """Build sandbox template for Python venv."""
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
 
-try:
-    from onyx.server.features.build.configs import (
-        OUTPUTS_TEMPLATE_PATH,
-        VENV_TEMPLATE_PATH,
-    )
-except ImportError:
-    # Fallback if running as standalone script
-    import os
-
-    OUTPUTS_TEMPLATE_PATH = os.environ.get(
-        "OUTPUTS_TEMPLATE_PATH", "/templates/outputs"
-    )
-    VENV_TEMPLATE_PATH = os.environ.get("VENV_TEMPLATE_PATH", "/templates/venv")
+OUTPUTS_TEMPLATE_PATH = os.environ.get("OUTPUTS_TEMPLATE_PATH", "/templates/outputs")
+VENV_TEMPLATE_PATH = os.environ.get("VENV_TEMPLATE_PATH", "/templates/venv")
 
 
 def build_python_venv_template(target_path: Path, requirements_path: Path) -> None:

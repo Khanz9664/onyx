@@ -6,7 +6,7 @@ import SimpleLoader from "@/refresh-components/loaders/SimpleLoader";
 import SlackChannelConfigsTable from "./SlackChannelConfigsTable";
 import { useSlackBot, useSlackChannelConfigsByBot } from "./hooks";
 import { ExistingSlackBotForm } from "../SlackBotUpdateForm";
-import * as SettingsLayouts from "@/layouts/settings-layouts";
+import { SettingsLayouts } from "@opal/layouts";
 import { SvgSlack } from "@opal/logos";
 import { getErrorMsg } from "@/lib/error";
 
@@ -82,7 +82,7 @@ export default function Page({
         icon={SvgSlack}
         title="Edit Slack Bot"
         backButton
-        separator
+        divider
       />
       <SettingsLayouts.Body>
         <SlackBotEditContent botId={unwrappedParams["bot-id"]} />

@@ -16,6 +16,7 @@ from onyx.chat.emitter import Emitter
 from onyx.chat.models import ChatMessageSimple
 from onyx.chat.models import LlmStepResult
 from onyx.chat.tool_call_args_streaming import maybe_emit_argument_delta
+from onyx.configs.app_configs import ENABLE_AZURE_IMAGE_CAP
 from onyx.configs.app_configs import LOG_ONYX_MODEL_INTERACTIONS
 from onyx.configs.app_configs import PROMPT_CACHE_CHAT_HISTORY
 from onyx.configs.constants import MessageType
@@ -42,6 +43,7 @@ from onyx.llm.models import UserMessage
 from onyx.llm.prompt_cache.processor import process_with_prompt_cache
 from onyx.llm.utils import model_needs_formatting_reenabled
 from onyx.prompts.chat_prompts import CODE_BLOCK_MARKDOWN
+from onyx.prompts.chat_prompts import IMAGE_DROP_REMINDER
 from onyx.prompts.constants import SYSTEM_REMINDER_TAG_CLOSE
 from onyx.prompts.constants import SYSTEM_REMINDER_TAG_OPEN
 from onyx.server.query_and_chat.placement import Placement
@@ -53,6 +55,8 @@ from onyx.server.query_and_chat.streaming_models import ReasoningDelta
 from onyx.server.query_and_chat.streaming_models import ReasoningDone
 from onyx.server.query_and_chat.streaming_models import ReasoningStart
 from onyx.tools.models import ToolCallKickoff
+from onyx.tools.tool_name import sanitize_tool_name
+from onyx.tracing.flows import LLMFlow
 from onyx.tracing.framework.create import generation_span
 from onyx.utils.b64 import get_image_type_from_bytes
 from onyx.utils.jsonriver import Parser
@@ -347,9 +351,9 @@ def _update_tool_call_with_delta(
             tool_calls_in_progress[index]["name"] = tool_call_delta.function.name
 
         if tool_call_delta.function.arguments:
-            tool_calls_in_progress[index][
-                "arguments"
-            ] += tool_call_delta.function.arguments
+            tool_calls_in_progress[index]["arguments"] += (
+                tool_call_delta.function.arguments
+            )
 
 
 def _extract_tool_call_kickoffs(
@@ -482,7 +486,8 @@ def extract_tool_calls_from_response_text(
         )
 
     logger.info(
-        f"Extracted {len(tool_calls)} tool call(s) from response text as fallback"
+        "Extracted %s tool call(s) from response text as fallback",
+        len(tool_calls),
     )
 
     return tool_calls
@@ -678,7 +683,7 @@ def _build_structured_assistant_message(msg: ChatMessageSimple) -> AssistantMess
                 id=tc.tool_call_id,
                 type="function",
                 function=FunctionCall(
-                    name=tc.tool_name,
+                    name=sanitize_tool_name(tc.tool_name),
                     arguments=json.dumps(tc.tool_arguments),
                 ),
             )
@@ -768,6 +773,59 @@ def _get_history_message_formatter(llm_config: LLMConfig) -> _HistoryMessageForm
     return _DEFAULT_HISTORY_MESSAGE_FORMATTER
 
 
+# Azure OpenAI documents a 50-image limit per request; other Azure-hosted
+# models don't publish one. When ENABLE_AZURE_IMAGE_CAP=true is set, we cap
+# all Azure providers at 50 to avoid raw 400s from the gateway. Off by
+# default — no cap is applied to any provider.
+_AZURE_DEFAULT_IMAGE_CAP = 50
+
+
+def _is_azure_provider(model_provider: str) -> bool:
+    """True for any provider whose name starts with 'azure'."""
+    return model_provider.startswith("azure")
+
+
+def resolve_image_cap(model_provider: str) -> int | None:
+    """Return the per-request image-count cap, or None if no cap should be
+    enforced. Only Azure providers are capped, and only when
+    ENABLE_AZURE_IMAGE_CAP=true is set."""
+    if ENABLE_AZURE_IMAGE_CAP and _is_azure_provider(model_provider):
+        return _AZURE_DEFAULT_IMAGE_CAP
+    return None
+
+
+def _select_recent_image_indices(
+    history: list[ChatMessageSimple], cap: int
+) -> tuple[set[tuple[int, int]], int]:
+    """Pick which (msg_idx, img_idx) positions to keep when the request has
+    more images than the cap. Walks messages newest-to-oldest (recency wins
+    across turns) but walks images within each message in attachment order
+    (earlier positions preferred). This matters in mixed messages where
+    user-attached images appear first in image_files and project-context
+    images are appended at the end — when the cap bites, we prefer to keep
+    what the user explicitly attached over project-context fill.
+
+    Returns the keep-set and the count of images that would be dropped. Only
+    ChatFileType.IMAGE entries on USER messages count — that matches what
+    translate_history_to_llm_format actually emits, so cap slots aren't
+    wasted on images that would never reach the LLM."""
+    keep: set[tuple[int, int]] = set()
+    total = 0
+    kept = 0
+    for msg_idx in range(len(history) - 1, -1, -1):
+        msg = history[msg_idx]
+        if msg.message_type != MessageType.USER or not msg.image_files:
+            continue
+        for img_idx, img in enumerate(msg.image_files):
+            if img.file_type != ChatFileType.IMAGE:
+                continue
+            total += 1
+            if kept < cap:
+                keep.add((msg_idx, img_idx))
+                kept += 1
+    return keep, max(0, total - cap)
+
+
 def translate_history_to_llm_format(
     history: list[ChatMessageSimple],
     llm_config: LLMConfig,
@@ -784,6 +842,28 @@ def translate_history_to_llm_format(
     # may be less semantically meaningful, but it remains safe and order-preserving.
     last_cacheable_msg_idx = -1
     all_previous_msgs_cacheable = True
+
+    # Per-request image cap (provider-aware). When the cap is enforced and
+    # images are dropped, we emit a system-reminder UserMessage at the end of
+    # the translated request — the same pattern MessageType.USER_REMINDER uses.
+    image_cap = resolve_image_cap(llm_config.model_provider)
+    keep_image_indices: set[tuple[int, int]] | None = None
+    image_drop_notice: str | None = None
+    if image_cap is not None:
+        keep_image_indices, dropped_image_count = _select_recent_image_indices(
+            history, image_cap
+        )
+        if dropped_image_count > 0:
+            logger.warning(
+                "Image cap enforced: provider=%s model=%s cap=%d dropped=%d",
+                llm_config.model_provider,
+                llm_config.model_name,
+                image_cap,
+                dropped_image_count,
+            )
+            image_drop_notice = IMAGE_DROP_REMINDER.format(
+                dropped_count=dropped_image_count
+            )
 
     for idx, msg in enumerate(history):
         # if the message is being added to the history
@@ -818,32 +898,40 @@ def translate_history_to_llm_format(
                     )
                 ]
 
-                # Add image parts
-                for img_file in msg.image_files:
-                    if img_file.file_type == ChatFileType.IMAGE:
-                        try:
-                            image_type = get_image_type_from_bytes(img_file.content)
-                            base64_data = img_file.to_base64()
-                            image_url = f"data:{image_type};base64,{base64_data}"
+                # Add image parts (skipping any beyond the per-request cap)
+                for img_idx, img_file in enumerate(msg.image_files):
+                    if img_file.file_type != ChatFileType.IMAGE:
+                        continue
+                    if (
+                        keep_image_indices is not None
+                        and (idx, img_idx) not in keep_image_indices
+                    ):
+                        continue
+                    try:
+                        image_type = get_image_type_from_bytes(img_file.content)
+                        base64_data = img_file.to_base64()
+                        image_url = f"data:{image_type};base64,{base64_data}"
 
-                            content_parts.append(
-                                TextContentPart(
-                                    type="text",
-                                    text=f"[attached image — file_id: {img_file.file_id}]",
-                                )
+                        content_parts.append(
+                            TextContentPart(
+                                type="text",
+                                text=f"[attached image — file_id: {img_file.file_id}]",
                             )
-                            image_part = ImageContentPart(
-                                type="image_url",
-                                image_url=ImageUrlDetail(
-                                    url=image_url,
-                                    detail=None,
-                                ),
-                            )
-                            content_parts.append(image_part)
-                        except Exception as e:
-                            logger.warning(
-                                f"Failed to process image file {img_file.file_id}: {e}. Skipping image."
-                            )
+                        )
+                        image_part = ImageContentPart(
+                            type="image_url",
+                            image_url=ImageUrlDetail(
+                                url=image_url,
+                                detail=None,
+                            ),
+                        )
+                        content_parts.append(image_part)
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to process image file %s: %s. Skipping image.",
+                            img_file.file_id,
+                            e,
+                        )
                 user_msg = UserMessage(
                     role="user",
                     content=content_parts,
@@ -875,8 +963,20 @@ def translate_history_to_llm_format(
 
         else:
             logger.warning(
-                f"Unknown message type {msg.message_type} in history. Skipping message."
+                "Unknown message type %s in history. Skipping message.",
+                msg.message_type,
             )
+
+    # Surface the image-drop notice as a trailing system-reminder UserMessage
+    # — mirrors how MessageType.USER_REMINDER is wrapped (see USER_REMINDER
+    # branch above). Keeps operational metadata out of the user's content.
+    if image_drop_notice is not None:
+        wrapped = (
+            f"{SYSTEM_REMINDER_TAG_OPEN}\n"
+            f"{image_drop_notice}\n"
+            f"{SYSTEM_REMINDER_TAG_CLOSE}"
+        )
+        messages.append(UserMessage(role="user", content=wrapped))
 
     # Apply model-specific formatting when translating to LLM format (e.g. OpenAI
     # reasoning models need CODE_BLOCK_MARKDOWN prefix for correct markdown generation)
@@ -1009,7 +1109,8 @@ def run_llm_step_pkt_generator(
 
     if LOG_ONYX_MODEL_INTERACTIONS:
         logger.debug(
-            f"Message history:\n{_format_message_history_for_logging(llm_msg_history)}"
+            "Message history:\n%s",
+            _format_message_history_for_logging(llm_msg_history),
         )
 
     id_to_tool_call_map: dict[int, dict[str, Any]] = {}
@@ -1032,6 +1133,7 @@ def run_llm_step_pkt_generator(
         model_config={
             "base_url": str(llm.config.api_base or ""),
             "model_impl": "litellm",
+            "flow": LLMFlow.CHAT_RESPONSE.value,
         },
     ) as span_generation:
         span_generation.span_data.input = cast(
@@ -1179,7 +1281,9 @@ def run_llm_step_pkt_generator(
                 empty_chunk_count += 1
                 logger.warning(
                     "LLM packet is empty (no content, reasoning, or tool calls). "
-                    f"finish_reason={finish_reason}. Skipping: {packet}"
+                    "finish_reason=%s. Skipping: %s",
+                    finish_reason,
+                    packet,
                 )
                 continue
 
@@ -1313,25 +1417,32 @@ def run_llm_step_pkt_generator(
     # Note: Content (AgentResponseDelta) doesn't need an explicit end packet - OverallStop handles it
     # Tool calls are handled by tool execution code and emit their own packets (e.g., SectionEnd)
     if LOG_ONYX_MODEL_INTERACTIONS:
-        logger.debug(f"Accumulated reasoning: {accumulated_reasoning}")
-        logger.debug(f"Accumulated answer: {accumulated_answer}")
+        logger.debug("Accumulated reasoning: %s", accumulated_reasoning)
+        logger.debug("Accumulated answer: %s", accumulated_answer)
 
         if tool_calls:
             tool_calls_str = "\n".join(
                 f"  - {tc.tool_name}: {json.dumps(tc.tool_args, indent=4)}"
                 for tc in tool_calls
             )
-            logger.debug(f"Tool calls:\n{tool_calls_str}")
+            logger.debug("Tool calls:\n%s", tool_calls_str)
         else:
             logger.debug("Tool calls: []")
 
     if actionable_chunk_count == 0:
         logger.warning(
             "LLM stream completed with no actionable deltas. "
-            f"chunks={stream_chunk_count}, empty_chunks={empty_chunk_count}, "
-            f"finish_reasons={sorted(finish_reasons)}, "
-            f"provider={llm.config.model_provider}, model={llm.config.model_name}, "
-            f"tool_choice={tool_choice}, tools_sent={len(tool_definitions)}"
+            "chunks=%s, empty_chunks=%s, "
+            "finish_reasons=%s, "
+            "provider=%s, model=%s, "
+            "tool_choice=%s, tools_sent=%s",
+            stream_chunk_count,
+            empty_chunk_count,
+            sorted(finish_reasons),
+            llm.config.model_provider,
+            llm.config.model_name,
+            tool_choice,
+            len(tool_definitions),
         )
 
     return (

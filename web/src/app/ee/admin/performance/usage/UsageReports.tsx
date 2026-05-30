@@ -14,7 +14,7 @@ import {
 } from "@/components/ui/table";
 import { Text } from "@opal/components";
 import Title from "@/components/ui/title";
-import Spacer from "@/refresh-components/Spacer";
+import { Spacer } from "@opal/components";
 import Button from "@/refresh-components/buttons/Button";
 import { Button as OpalButton } from "@opal/components";
 import useSWR from "swr";
@@ -28,9 +28,9 @@ import { ErrorCallout } from "@/components/ErrorCallout";
 import { PageSelector } from "@/components/PageSelector";
 import { Divider } from "@opal/components";
 import { DateRangePickerValue } from "../../../../../components/dateRangeSelectors/AdminDateRangeSelector";
-import Popover from "@/refresh-components/Popover";
+import { Popover } from "@opal/components";
 import Calendar from "@/refresh-components/Calendar";
-import { cn } from "@/lib/utils";
+import { cn } from "@opal/utils";
 import { Spinner } from "@/components/Spinner";
 import { SvgCalendar, SvgDownloadCloud } from "@opal/icons";
 

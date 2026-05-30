@@ -2,7 +2,7 @@
 
 import { usePathname } from "next/navigation";
 import * as AppLayouts from "@/layouts/app-layouts";
-import * as SettingsLayouts from "@/layouts/settings-layouts";
+import { SettingsLayouts } from "@opal/layouts";
 import { SidebarTab } from "@opal/components";
 import { SvgSliders } from "@opal/icons";
 import { useUser } from "@/providers/UserProvider";
@@ -25,7 +25,7 @@ export default function Layout({ children }: LayoutProps) {
   return (
     <AppLayouts.Root>
       <SettingsLayouts.Root width="lg">
-        <SettingsLayouts.Header icon={SvgSliders} title="Settings" separator />
+        <SettingsLayouts.Header icon={SvgSliders} title="Settings" divider />
 
         <SettingsLayouts.Body>
           <Section
@@ -37,7 +37,7 @@ export default function Layout({ children }: LayoutProps) {
             {/* Left: Tab Navigation */}
             <div
               data-testid="settings-left-tab-navigation"
-              className="flex flex-col px-2 min-w-[12.5rem]"
+              className="flex flex-col px-2 min-w-50"
             >
               <SidebarTab
                 href="/app/settings/general"

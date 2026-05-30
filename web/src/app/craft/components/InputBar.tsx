@@ -5,28 +5,27 @@ import {
   forwardRef,
   useImperativeHandle,
   useCallback,
-  useEffect,
+  useMemo,
   useRef,
   useState,
   type ChangeEvent,
   type ClipboardEvent,
   type KeyboardEvent,
+  type SyntheticEvent,
 } from "react";
-import { useRouter } from "next/navigation";
 import { getPastedFilesIfNoText } from "@/lib/clipboard";
-import { cn, isImageFile } from "@/lib/utils";
+import { isImageFile } from "@/lib/utils";
+import PasteTilePopover from "@/sections/input/PasteTilePopover";
+import SkillPickerPopover from "@/sections/input/SkillPickerPopover";
+import { cn } from "@opal/utils";
 import { Disabled } from "@opal/core";
 import {
   useUploadFilesContext,
   BuildFile,
   UploadFileStatus,
 } from "@/app/craft/contexts/UploadFilesContext";
-import { useDemoDataEnabled } from "@/app/craft/hooks/useBuildSessionStore";
-import { CRAFT_CONFIGURE_PATH } from "@/app/craft/v1/constants";
 import IconButton from "@/refresh-components/buttons/IconButton";
-import SelectButton from "@/refresh-components/buttons/SelectButton";
-import { Button } from "@opal/components";
-import { Tooltip } from "@opal/components";
+import { Button, Tooltip } from "@opal/components";
 import {
   SvgArrowUp,
   SvgClock,
@@ -35,11 +34,20 @@ import {
   SvgLoader,
   SvgX,
   SvgPaperclip,
-  SvgOrganization,
   SvgAlertCircle,
 } from "@opal/icons";
-
-const MAX_INPUT_HEIGHT = 200;
+import { useContentEditable } from "@/hooks/useContentEditable";
+import { useUser } from "@/providers/UserProvider";
+import useUserSkills from "@/hooks/useUserSkills";
+import { detectSlashTrigger, toPickerSkills } from "@/lib/skills/picker";
+import { getTextContent } from "@/lib/contentEditable";
+import QueuedMessageBar from "@/sections/input/QueuedMessageBar";
+import { useQueuedMessageNavigation } from "@/hooks/useQueuedMessageNavigation";
+import {
+  QueuedMessage,
+  MAX_QUEUED_MESSAGES,
+  EMPTY_QUEUED_MESSAGES,
+} from "@/app/app/interfaces";
 
 export interface InputBarHandle {
   reset: () => void;
@@ -48,20 +56,16 @@ export interface InputBarHandle {
 }
 
 export interface InputBarProps {
-  onSubmit: (
-    message: string,
-    files: BuildFile[],
-    demoDataEnabled: boolean
-  ) => void;
+  onSubmit: (message: string, files: BuildFile[]) => void;
   isRunning: boolean;
   disabled?: boolean;
   placeholder?: string;
-  /** When true, shows spinner on send button with "Initializing sandbox..." tooltip */
   sandboxInitializing?: boolean;
-  /** When true, removes bottom rounding to allow seamless connection with components below */
   noBottomRounding?: boolean;
-  /** Whether this is the welcome page (no existing session in URL). Used for Demo Data pill. */
-  isWelcomePage?: boolean;
+  /** Queued messages + callbacks; when wired, submitting mid-stream enqueues. */
+  queuedMessages?: readonly QueuedMessage[];
+  onQueueMessage?: (text: string) => void;
+  onRemoveQueuedMessage?: (index: number) => void;
 }
 
 /**
@@ -109,7 +113,7 @@ function BuildFileCard({
       </span>
       <button
         onClick={() => onRemove(file.id)}
-        className="ml-1 p-0.5 hover:bg-background-neutral-02 rounded"
+        className="ml-1 p-0.5 hover:bg-background-neutral-02 rounded-sm"
       >
         <SvgX className="h-3 w-3 text-text-03" />
       </button>
@@ -159,15 +163,40 @@ const InputBar = memo(
         placeholder = "Describe your task...",
         sandboxInitializing = false,
         noBottomRounding = false,
-        isWelcomePage = false,
+        queuedMessages,
+        onQueueMessage,
+        onRemoveQueuedMessage,
       },
       ref
     ) => {
-      const router = useRouter();
-      const demoDataEnabled = useDemoDataEnabled();
-      const [message, setMessage] = useState("");
+      // Queueing is enabled only when the parent wires up the callbacks.
+      const queueEnabled = !!onQueueMessage;
+      const queue = queuedMessages ?? EMPTY_QUEUED_MESSAGES;
+      const { user } = useUser();
+      const inputWrapperRef = useRef<HTMLDivElement>(null);
+      const {
+        ref: inputRef,
+        message,
+        setMessage,
+        clearMessage,
+        handleInput: onInput,
+        handleCompositionStart,
+        handleCompositionEnd,
+        pasteText,
+        handleCopy,
+        handleCut,
+        setCursorToEnd,
+        handleTileMouseDown,
+        handleTileClick,
+        handleTileKeyDown,
+        tilePopover,
+        dismissTilePopover,
+        updateTileText,
+      } = useContentEditable({
+        wrapperRef: inputWrapperRef,
+        pasteTilesEnabled: user?.preferences?.paste_as_tile ?? false,
+      });
 
-      const textAreaRef = useRef<HTMLTextAreaElement>(null);
       const containerRef = useRef<HTMLDivElement>(null);
       const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -179,44 +208,129 @@ const InputBar = memo(
         hasUploadingFiles,
       } = useUploadFilesContext();
 
-      // Expose reset, focus, and setMessage methods to parent via ref
+      // `/` skill picker state. The picker watches contentEditable input,
+      // shows accessible skills, and on select replaces the `/<query>` token
+      // with `/<slug> `.
+      const { data: skillsData } = useUserSkills();
+      const pickerSkills = useMemo(
+        () => toPickerSkills(skillsData),
+        [skillsData]
+      );
+      const [skillPicker, setSkillPicker] = useState<{
+        open: boolean;
+        anchorRect: DOMRect | null;
+        query: string;
+        slashIndex: number;
+      }>({ open: false, anchorRect: null, query: "", slashIndex: -1 });
+
+      // Shared queued-message keyboard navigation + highlight state.
+      const queueNav = useQueuedMessageNavigation({
+        messages: queue,
+        inputIsEmpty: !message,
+        onRemove: (index) => onRemoveQueuedMessage?.(index),
+        onEdit: setMessage,
+      });
+
+      const getTextBeforeCursor = useCallback((): string | null => {
+        const el = inputRef.current;
+        if (!el) return null;
+        const sel = window.getSelection();
+        if (!sel || sel.rangeCount === 0) return null;
+        const range = sel.getRangeAt(0);
+        if (!el.contains(range.startContainer)) return null;
+        const cloned = range.cloneRange();
+        cloned.selectNodeContents(el);
+        cloned.setEnd(range.startContainer, range.startOffset);
+        const tmp = document.createElement("div");
+        tmp.appendChild(cloned.cloneContents());
+        return getTextContent(tmp);
+      }, [inputRef]);
+
+      const getCaretRect = useCallback((): DOMRect | null => {
+        const sel = window.getSelection();
+        if (!sel || sel.rangeCount === 0) return null;
+        const range = sel.getRangeAt(0).cloneRange();
+        range.collapse(true);
+        const rect = range.getBoundingClientRect();
+        if (
+          rect.top === 0 &&
+          rect.left === 0 &&
+          rect.width === 0 &&
+          rect.height === 0
+        ) {
+          return inputRef.current?.getBoundingClientRect() ?? null;
+        }
+        return rect;
+      }, [inputRef]);
+
+      const evaluateSkillPicker = useCallback(() => {
+        const textBefore = getTextBeforeCursor();
+        if (textBefore === null) {
+          setSkillPicker((s) => (s.open ? { ...s, open: false } : s));
+          return;
+        }
+        const trigger = detectSlashTrigger(textBefore);
+        if (!trigger) {
+          setSkillPicker((s) => (s.open ? { ...s, open: false } : s));
+          return;
+        }
+        setSkillPicker({
+          open: true,
+          anchorRect: getCaretRect(),
+          query: trigger.query,
+          slashIndex: trigger.slashIndex,
+        });
+      }, [getCaretRect, getTextBeforeCursor]);
+
+      const handleEnhancedInput = useCallback(
+        (event: SyntheticEvent<HTMLDivElement>) => {
+          onInput(event);
+          evaluateSkillPicker();
+        },
+        [onInput, evaluateSkillPicker]
+      );
+
+      // Re-evaluate the slash trigger when the caret moves without input
+      // (arrow keys, Home/End, mouse clicks). Without this, the picker can
+      // hold a stale `slashIndex`/`query` from a previous position and
+      // replace the wrong text on select.
+      const handleSelectionChange = useCallback(() => {
+        evaluateSkillPicker();
+      }, [evaluateSkillPicker]);
+
+      const closeSkillPicker = useCallback(() => {
+        setSkillPicker((s) => ({ ...s, open: false }));
+      }, []);
+
+      const handleSkillPickerSelect = useCallback(
+        (slug: string) => {
+          setSkillPicker((prev) => {
+            if (!prev.open) return prev;
+            const replacement = `/${slug} `;
+            const newText =
+              message.slice(0, prev.slashIndex) +
+              replacement +
+              message.slice(prev.slashIndex + 1 + prev.query.length);
+            setMessage(newText);
+            return { ...prev, open: false };
+          });
+        },
+        [message, setMessage]
+      );
+
       useImperativeHandle(ref, () => ({
         reset: () => {
-          setMessage("");
+          clearMessage();
           clearFiles();
         },
         focus: () => {
-          textAreaRef.current?.focus();
+          inputRef.current?.focus();
+          setCursorToEnd();
         },
         setMessage: (msg: string) => {
           setMessage(msg);
-          // Move cursor to end after setting message
-          setTimeout(() => {
-            const textarea = textAreaRef.current;
-            if (textarea) {
-              textarea.focus();
-              textarea.setSelectionRange(msg.length, msg.length);
-            }
-          }, 0);
         },
       }));
-
-      // Auto-resize textarea based on content
-      useEffect(() => {
-        const textarea = textAreaRef.current;
-        if (textarea) {
-          textarea.style.height = "0px";
-          textarea.style.height = `${Math.min(
-            textarea.scrollHeight,
-            MAX_INPUT_HEIGHT
-          )}px`;
-        }
-      }, [message]);
-
-      // Auto-focus on mount
-      useEffect(() => {
-        textAreaRef.current?.focus();
-      }, []);
 
       const handleFileSelect = useCallback(
         async (e: ChangeEvent<HTMLInputElement>) => {
@@ -231,37 +345,44 @@ const InputBar = memo(
 
       const handlePaste = useCallback(
         (event: ClipboardEvent) => {
+          if (disabled) return;
           const pastedFiles = getPastedFilesIfNoText(event.clipboardData);
           if (pastedFiles.length > 0) {
             event.preventDefault();
-            // Context handles session binding internally
             uploadFiles(pastedFiles);
+            return;
           }
-        },
-        [uploadFiles]
-      );
 
-      const handleInputChange = useCallback(
-        (event: ChangeEvent<HTMLTextAreaElement>) => {
-          setMessage(event.target.value);
+          event.preventDefault();
+          const text = event.clipboardData.getData("text/plain");
+          if (!text) return;
+
+          pasteText(text);
         },
-        []
+        [disabled, uploadFiles, pasteText]
       );
 
       const handleSubmit = useCallback(() => {
-        if (disabled || isRunning || hasUploadingFiles || sandboxInitializing)
+        // File uploads / sandbox init are hard blockers regardless of queueing.
+        if (disabled || hasUploadingFiles || sandboxInitializing) return;
+
+        const text = message.trim();
+
+        // While streaming, queue the message; the parent auto-sends it later.
+        if (isRunning) {
+          if (onQueueMessage && text && queue.length < MAX_QUEUED_MESSAGES) {
+            onQueueMessage(text);
+            clearMessage();
+          }
           return;
+        }
 
-        const hasMessage = message.trim().length > 0;
         const hasFiles = currentMessageFiles.length > 0;
-
-        if (hasMessage) {
-          onSubmit(message.trim(), currentMessageFiles, demoDataEnabled);
-          setMessage("");
+        if (text) {
+          onSubmit(text, currentMessageFiles);
+          clearMessage();
           clearFiles({ suppressRefetch: true });
         } else if (hasFiles) {
-          // User hit Enter with only files attached: remove files from input bar
-          // (File stays in session; no way to delete from session for now)
           clearFiles({ suppressRefetch: true });
         }
       }, [
@@ -271,13 +392,19 @@ const InputBar = memo(
         hasUploadingFiles,
         sandboxInitializing,
         onSubmit,
+        onQueueMessage,
+        queue,
         currentMessageFiles,
         clearFiles,
-        demoDataEnabled,
+        clearMessage,
       ]);
 
       const handleKeyDown = useCallback(
-        (event: KeyboardEvent<HTMLTextAreaElement>) => {
+        (event: KeyboardEvent<HTMLDivElement>) => {
+          if (handleTileKeyDown(event)) return;
+          if (queueEnabled && queueNav.handleKeyDown(event)) return;
+
+          // Shift+Enter falls through to browser default: inserts <br>
           if (
             event.key === "Enter" &&
             !event.shiftKey &&
@@ -287,18 +414,27 @@ const InputBar = memo(
             handleSubmit();
           }
         },
-        [handleSubmit]
+        [handleSubmit, handleTileKeyDown, queueEnabled, queueNav]
       );
 
       const canSubmit =
         message.trim().length > 0 &&
         !disabled &&
-        !isRunning &&
         !hasUploadingFiles &&
-        !sandboxInitializing;
+        !sandboxInitializing &&
+        (!isRunning || (queueEnabled && queue.length < MAX_QUEUED_MESSAGES));
 
       return (
         <Disabled disabled={disabled}>
+          {queueEnabled && (
+            <QueuedMessageBar
+              messages={queue}
+              highlightedIndex={queueNav.highlightedIndex}
+              awaitingPreferredSelection={false}
+              onDiscard={(index) => onRemoveQueuedMessage?.(index)}
+              onHighlight={queueNav.setHighlightedIndex}
+            />
+          )}
           <div
             ref={containerRef}
             className={cn(
@@ -313,7 +449,6 @@ const InputBar = memo(
               className="hidden"
               multiple
               onChange={handleFileSelect}
-              accept="*/*"
             />
 
             {/* Attached Files */}
@@ -330,34 +465,55 @@ const InputBar = memo(
             )}
 
             {/* Input area */}
-            <textarea
-              onPaste={handlePaste}
-              onChange={handleInputChange}
-              onKeyDown={handleKeyDown}
-              ref={textAreaRef}
-              className={cn(
-                "w-full",
-                "h-[44px]",
-                "outline-none",
-                "bg-transparent",
-                "resize-none",
-                "placeholder:text-text-03",
-                "whitespace-pre-wrap",
-                "break-word",
-                "overscroll-contain",
-                "overflow-y-auto",
-                "px-3",
-                "pb-2",
-                "pt-3"
-              )}
-              autoFocus
-              style={{ scrollbarWidth: "thin" }}
-              role="textarea"
-              aria-multiline
-              placeholder={placeholder}
-              value={message}
-              disabled={disabled}
-            />
+            <div ref={inputWrapperRef} className="flex-1 overflow-hidden">
+              <div
+                ref={inputRef}
+                contentEditable={!disabled}
+                suppressContentEditableWarning
+                onPaste={handlePaste}
+                onInput={handleEnhancedInput}
+                onCompositionStart={handleCompositionStart}
+                onCompositionEnd={handleCompositionEnd}
+                onKeyDown={handleKeyDown}
+                onKeyUp={handleSelectionChange}
+                onMouseUp={handleSelectionChange}
+                onBlur={() => queueNav.setHighlightedIndex(null)}
+                className={cn(
+                  "w-full",
+                  "h-full",
+                  "min-h-[44px]",
+                  "outline-hidden",
+                  "bg-transparent",
+                  "whitespace-pre-wrap",
+                  "wrap-break-word",
+                  "overscroll-contain",
+                  "overflow-y-auto",
+                  "px-3",
+                  "pb-2",
+                  "pt-3"
+                )}
+                tabIndex={disabled ? -1 : 0}
+                style={{
+                  scrollbarWidth: "thin",
+                  scrollbarColor: "var(--border-02) transparent",
+                }}
+                role="textbox"
+                aria-label="Message input"
+                aria-multiline={true}
+                aria-disabled={disabled}
+                aria-placeholder={placeholder}
+                data-placeholder={
+                  !message && queueEnabled && queue.length > 0
+                    ? "Press up to edit queued messages"
+                    : placeholder
+                }
+                data-empty={!message ? "" : undefined}
+                onCopy={handleCopy}
+                onCut={handleCut}
+                onMouseDown={handleTileMouseDown}
+                onClick={handleTileClick}
+              />
+            </div>
 
             {/* Bottom controls */}
             <div className="flex justify-between items-center w-full p-1 min-h-[40px]">
@@ -371,27 +527,6 @@ const InputBar = memo(
                   prominence="tertiary"
                   onClick={() => fileInputRef.current?.click()}
                 />
-                {/* Demo Data indicator pill - only show on welcome page (no session) when demo data is enabled */}
-                {demoDataEnabled && isWelcomePage && (
-                  <Tooltip
-                    tooltip="Switch to your data in the Configure panel!"
-                    side="top"
-                  >
-                    <span>
-                      <SelectButton
-                        disabled={disabled}
-                        leftIcon={SvgOrganization}
-                        engaged={demoDataEnabled}
-                        action
-                        folded
-                        onClick={() => router.push(CRAFT_CONFIGURE_PATH)}
-                        className="bg-action-link-01"
-                      >
-                        Demo Data Active
-                      </SelectButton>
-                    </span>
-                  </Tooltip>
-                )}
               </div>
 
               {/* Bottom right controls */}
@@ -412,6 +547,22 @@ const InputBar = memo(
               </div>
             </div>
           </div>
+          {tilePopover && (
+            <PasteTilePopover
+              text={tilePopover.text}
+              tileElement={tilePopover.tile}
+              onDismiss={dismissTilePopover}
+              onTextChange={updateTileText}
+            />
+          )}
+          <SkillPickerPopover
+            open={skillPicker.open}
+            anchorRect={skillPicker.anchorRect}
+            query={skillPicker.query}
+            skills={pickerSkills}
+            onSelect={handleSkillPickerSelect}
+            onClose={closeSkillPicker}
+          />
         </Disabled>
       );
     }

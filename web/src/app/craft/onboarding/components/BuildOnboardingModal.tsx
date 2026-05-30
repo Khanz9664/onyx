@@ -7,7 +7,7 @@ import {
   LLMProviderConfiguredSource,
 } from "@/lib/analytics";
 import { SvgArrowRight, SvgArrowLeft, SvgX } from "@opal/icons";
-import { cn } from "@/lib/utils";
+import { cn } from "@opal/utils";
 import Text from "@/refresh-components/texts/Text";
 import {
   BuildUserInfo,
@@ -22,9 +22,9 @@ import {
   getBuildLlmSelection,
   getDefaultLlmSelection,
 } from "@/app/craft/onboarding/constants";
-import { LLMProviderDescriptor } from "@/interfaces/llm";
-import { LLM_PROVIDERS_ADMIN_URL } from "@/lib/llmConfig/constants";
-import { testApiKeyHelper } from "@/sections/modals/llmConfig/svc";
+import { LLMProviderDescriptor } from "@/lib/languageModels/types";
+import { SWR_KEYS } from "@/lib/swr-keys";
+import { testApiKeyHelper } from "@/sections/modals/languageModels/svc";
 import OnboardingInfoPages from "@/app/craft/onboarding/components/OnboardingInfoPages";
 import OnboardingUserInfo from "@/app/craft/onboarding/components/OnboardingUserInfo";
 import OnboardingLlmSetup, {
@@ -61,7 +61,6 @@ interface BuildOnboardingModalProps {
   initialValues: InitialValues;
   isAdmin: boolean;
   hasUserInfo: boolean;
-  allProvidersConfigured: boolean;
   hasAnyProvider: boolean;
   onComplete: (info: BuildUserInfo) => Promise<void>;
   onLlmComplete: () => Promise<void>;
@@ -72,15 +71,15 @@ interface BuildOnboardingModalProps {
 function getStepsForMode(
   mode: OnboardingModalMode,
   isAdmin: boolean,
-  allProvidersConfigured: boolean,
+  hasAnyProvider: boolean,
   hasUserInfo: boolean
 ): OnboardingStep[] {
   switch (mode.type) {
     case "initial-onboarding":
-      // Full flow: page1 → llm-setup (if admin + not all configured) → user-info
+      // Full flow: page1 → llm-setup (if admin + no provider yet) → user-info
       const steps: OnboardingStep[] = ["page1"];
 
-      if (isAdmin && !allProvidersConfigured) {
+      if (isAdmin && !hasAnyProvider) {
         steps.push("llm-setup");
       }
 
@@ -90,7 +89,7 @@ function getStepsForMode(
 
       return steps;
 
-    case "edit-persona":
+    case "edit-user-info":
       return ["user-info"];
 
     case "add-llm":
@@ -107,7 +106,6 @@ export default function BuildOnboardingModal({
   initialValues,
   isAdmin,
   hasUserInfo,
-  allProvidersConfigured,
   hasAnyProvider,
   onComplete,
   onLlmComplete,
@@ -115,8 +113,8 @@ export default function BuildOnboardingModal({
 }: BuildOnboardingModalProps) {
   // Compute steps based on mode
   const steps = useMemo(
-    () => getStepsForMode(mode, isAdmin, allProvidersConfigured, hasUserInfo),
-    [mode, isAdmin, allProvidersConfigured, hasUserInfo]
+    () => getStepsForMode(mode, isAdmin, hasAnyProvider, hasUserInfo),
+    [mode, isAdmin, hasAnyProvider, hasUserInfo]
   );
 
   // Determine initial step based on mode
@@ -220,7 +218,7 @@ export default function BuildOnboardingModal({
     setConnectionStatus("testing");
     setErrorMessage("");
 
-    const providerName = `build-mode-${currentProviderConfig.providerName}`;
+    const providerName = currentProviderConfig.label;
     const payload = {
       name: providerName,
       provider: currentProviderConfig.providerName,
@@ -236,7 +234,9 @@ export default function BuildOnboardingModal({
 
     const testResult = await testApiKeyHelper(
       currentProviderConfig.providerName,
-      payload
+      payload,
+      apiKey,
+      selectedModel
     );
 
     if (!testResult.ok) {
@@ -249,7 +249,7 @@ export default function BuildOnboardingModal({
 
     try {
       const response = await fetch(
-        `${LLM_PROVIDERS_ADMIN_URL}?is_creation=true`,
+        `${SWR_KEYS.adminLlmProviders}?is_creation=true`,
         {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
@@ -258,8 +258,18 @@ export default function BuildOnboardingModal({
       );
 
       if (!response.ok) {
+        // Surface the backend detail (e.g. a name collision) so the user gets
+        // an actionable message instead of a generic failure.
+        const detail = await response
+          .json()
+          .then((b) => (typeof b?.detail === "string" ? b.detail : null))
+          .catch(() => null);
+        const isConflict = response.status === 409 || response.status === 400;
         setErrorMessage(
-          "There was an issue creating the provider. Please try again."
+          detail ??
+            (isConflict
+              ? `A provider named "${providerName}" already exists — remove or rename it in Admin → LLM Providers, then retry.`
+              : "There was an issue creating the provider. Please try again.")
         );
         setConnectionStatus("error");
         return;
@@ -268,9 +278,12 @@ export default function BuildOnboardingModal({
       if (!llmProviders || llmProviders.length === 0) {
         const newProvider = await response.json();
         if (newProvider?.id) {
-          await fetch(`${LLM_PROVIDERS_ADMIN_URL}/${newProvider.id}/default`, {
-            method: "POST",
-          });
+          await fetch(
+            `${SWR_KEYS.adminLlmProviders}/${newProvider.id}/default`,
+            {
+              method: "POST",
+            }
+          );
         }
       }
 
@@ -373,7 +386,7 @@ export default function BuildOnboardingModal({
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       {/* Backdrop */}
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+      <div className="absolute inset-0 bg-black/50 backdrop-blur-xs" />
 
       {/* Modal */}
       <div className="relative z-10 w-full max-w-xl mx-4 bg-background-tint-01 rounded-16 shadow-lg border border-border-01">
@@ -420,13 +433,7 @@ export default function BuildOnboardingModal({
           )}
 
           {/* Page 1 - What is Onyx Craft? */}
-          {currentStep === "page1" && (
-            <OnboardingInfoPages
-              step="page1"
-              workArea={workArea}
-              level={level}
-            />
-          )}
+          {currentStep === "page1" && <OnboardingInfoPages step="page1" />}
 
           {/* Navigation buttons */}
           <div className="relative flex justify-between items-center pt-2">

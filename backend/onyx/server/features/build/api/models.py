@@ -1,5 +1,4 @@
 from datetime import datetime
-from enum import Enum
 from typing import Any
 from typing import TYPE_CHECKING
 from typing import Union
@@ -9,15 +8,15 @@ from pydantic import BaseModel
 from onyx.configs.constants import MessageType
 from onyx.db.enums import ArtifactType
 from onyx.db.enums import BuildSessionStatus
+from onyx.db.enums import EndpointPolicy
+from onyx.db.enums import ExternalAppType
 from onyx.db.enums import SandboxStatus
 from onyx.db.enums import SharingScope
-from onyx.server.features.build.sandbox.models import (
-    FilesystemEntry as FileSystemEntry,
-)
+from onyx.server.features.build.sandbox.models import FilesystemEntry as FileSystemEntry
 
 if TYPE_CHECKING:
-    from onyx.db.models import Sandbox
     from onyx.db.models import BuildSession
+    from onyx.db.models import Sandbox
 
 
 # ===== Session Models =====
@@ -25,12 +24,12 @@ class SessionCreateRequest(BaseModel):
     """Request to create a new build session."""
 
     name: str | None = None  # Optional session name
-    demo_data_enabled: bool = True  # Whether to enable demo org_info data in sandbox
-    user_work_area: str | None = None  # User's work area (e.g., "engineering")
-    user_level: str | None = None  # User's level (e.g., "ic", "manager")
     # LLM selection from user's cookie
     llm_provider_type: str | None = None  # Provider type (e.g., "anthropic", "openai")
     llm_model_name: str | None = None  # Model name (e.g., "claude-opus-4-5")
+    # Skip Next.js dev server startup. Used by integration tests that don't
+    # exercise the webapp proxy and don't want to pay the ~20s startup wait.
+    headless: bool = False
 
 
 class SessionUpdateRequest(BaseModel):
@@ -185,7 +184,7 @@ class MessageRequest(BaseModel):
 class MessageResponse(BaseModel):
     """Response containing message details.
 
-    All message data is stored in message_metadata as JSON (the raw ACP packet).
+    All message data is stored in message_metadata as JSON (the raw sandbox event packet).
     The turn_index groups all assistant responses under the user prompt they respond to.
 
     Packet types in message_metadata:
@@ -291,69 +290,144 @@ class PreProvisionedCheckResponse(BaseModel):
     session_id: str | None = None  # Session ID if valid, None otherwise
 
 
-# ===== Build Connector Models =====
-class BuildConnectorStatus(str, Enum):
-    """Status of a build connector."""
-
-    NOT_CONNECTED = "not_connected"
-    CONNECTED = "connected"
-    CONNECTED_WITH_ERRORS = "connected_with_errors"
-    INDEXING = "indexing"
-    ERROR = "error"
-    DELETING = "deleting"
-
-
-class BuildConnectorInfo(BaseModel):
-    """Simplified connector info for build admin panel."""
-
-    cc_pair_id: int
-    connector_id: int
-    credential_id: int
-    source: str
-    name: str
-    status: BuildConnectorStatus
-    docs_indexed: int
-    last_indexed: datetime | None
-    error_message: str | None = None
-
-
-class BuildConnectorListResponse(BaseModel):
-    """List of build connectors."""
-
-    connectors: list[BuildConnectorInfo]
-
-
-# ===== Suggestion Bubble Models =====
-class SuggestionTheme(str, Enum):
-    """Theme/category of a follow-up suggestion."""
-
-    ADD = "add"
-    QUESTION = "question"
-
-
-class SuggestionBubble(BaseModel):
-    """A single follow-up suggestion bubble."""
-
-    theme: SuggestionTheme
-    text: str
-
-
-class GenerateSuggestionsRequest(BaseModel):
-    """Request to generate follow-up suggestions."""
-
-    user_message: str  # First user message
-    assistant_message: str  # First assistant text response (accumulated)
-
-
-class GenerateSuggestionsResponse(BaseModel):
-    """Response containing generated suggestions."""
-
-    suggestions: list[SuggestionBubble]
-
-
 class PptxPreviewResponse(BaseModel):
     """Response with PPTX slide preview metadata."""
 
     slide_count: int
     slide_paths: list[str]  # Relative paths to slide JPEGs within session workspace
     cached: bool  # Whether result was served from cache
+
+
+# ===== External App Models =====
+class UpsertExternalAppRequest(BaseModel):
+    """Create or update an external app.
+
+    If `id` is provided, the row with that id is updated; otherwise a
+    new row is inserted (and a backing ``Skill`` row is created in the
+    same transaction). ``upstream_url_patterns`` is a list of regex
+    patterns matched by the egress proxy against outbound request URLs.
+    ``enabled`` (stored on the linked skill) is the kill switch the
+    proxy checks before injecting credentials.
+
+    Skill identity (slug, bundle bytes, sharing scope) is derived
+    server-side from ``app_type``; admins don't supply it.
+    """
+
+    id: int | None = None
+    name: str
+    description: str
+    enabled: bool
+    app_type: ExternalAppType
+    upstream_url_patterns: list[str]
+    auth_template: dict[str, Any]
+    organization_credentials: dict[str, str]
+    # Per-action overrides by catalog action id (built-in apps); validated on
+    # upsert. A map full-replaces stored overrides (empty clears); None leaves
+    # them untouched, so a partial update can't wipe the admin's choices.
+    action_policies: dict[str, EndpointPolicy] | None = None
+
+
+class ActionPolicyView(BaseModel):
+    """One action of a built-in app, with its effective policy — the admin's
+    stored override if set, otherwise ``ASK``."""
+
+    action_id: str
+    normalised_name: str
+    description: str
+    state: EndpointPolicy
+
+
+class ExternalAppAdminResponse(BaseModel):
+    """Admin-facing view of an external app (includes org credentials)."""
+
+    id: int
+    name: str
+    description: str
+    app_type: ExternalAppType
+    upstream_url_patterns: list[str]
+    auth_template: dict[str, Any]
+    organization_credentials: dict[str, Any]
+    enabled: bool
+    # The merged per-action policy view (built-in apps; empty for custom).
+    actions: list[ActionPolicyView]
+
+
+class UpsertUserCredentialsRequest(BaseModel):
+    """User-supplied credentials for a specific external app."""
+
+    user_credentials: dict[str, Any]
+
+
+class ExternalAppUserResponse(BaseModel):
+    """User-facing view of an external app.
+
+    `credential_keys` are the parameter names the calling user must supply —
+    derived from the app's `auth_template` minus whatever the organization
+    has already filled in. `credential_values` are the values the user has
+    previously stored for those keys (intersection — stale keys from
+    deleted/migrated templates are filtered out). `authenticated` is true
+    iff `credential_values` covers every key in `credential_keys`.
+
+    Admin-only fields (``organization_credentials``, ``auth_template``,
+    ``upstream_url_patterns``, ``enabled``) are intentionally omitted.
+    ``app_type`` is included — it's the non-sensitive provider
+    discriminator the UI needs to render the app.
+    """
+
+    id: int
+    name: str
+    description: str
+    app_type: ExternalAppType
+    credential_keys: list[str]
+    credential_values: dict[str, Any]
+    authenticated: bool
+
+
+class OAuthStartResponse(BaseModel):
+    authorize_url: str
+
+
+class OAuthCallbackRequest(BaseModel):
+    code: str
+    state: str
+
+
+class OAuthCallbackResponse(BaseModel):
+    success: bool
+    external_app_id: int
+
+
+class OrgCredentialFieldDescriptor(BaseModel):
+    """One credential field the admin must fill in to configure a
+    built-in provider."""
+
+    key: str
+    label: str
+    description: str
+    secret: bool
+
+
+class EndpointDescriptor(BaseModel):
+    """One action in a built-in provider's catalog, flattened for the admin UI.
+    The admin picks a policy per action; recognition rules stay backend-side."""
+
+    action_id: str
+    normalised_name: str
+    description: str
+
+
+class BuiltInExternalAppDescriptor(BaseModel):
+    """Backend-defined preset for a built-in OAuth provider. The admin
+    UI fetches these and uses them to render the Configure modal +
+    POST body, so adding a new provider is a backend-only change."""
+
+    app_type: ExternalAppType
+    name: str
+    description: str
+    upstream_url_patterns: list[str]
+    auth_template: dict[str, str]
+    required_org_credential_fields: list[OrgCredentialFieldDescriptor]
+    setup_instructions: str
+    # The catalog of actions an admin can govern (empty for providers without
+    # a catalog).
+    actions: list[EndpointDescriptor]

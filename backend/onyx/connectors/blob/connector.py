@@ -1,3 +1,4 @@
+import mimetypes
 import os
 import time
 from collections.abc import Mapping
@@ -7,6 +8,7 @@ from io import BytesIO
 from numbers import Integral
 from typing import Any
 from typing import Optional
+from typing import TYPE_CHECKING
 from urllib.parse import quote
 
 import boto3
@@ -16,7 +18,6 @@ from botocore.exceptions import ClientError
 from botocore.exceptions import NoCredentialsError
 from botocore.exceptions import PartialCredentialsError
 from botocore.session import get_session
-from mypy_boto3_s3 import S3Client
 
 from onyx.configs.app_configs import BLOB_STORAGE_SIZE_THRESHOLD
 from onyx.configs.app_configs import INDEX_BATCH_SIZE
@@ -25,6 +26,9 @@ from onyx.configs.constants import DocumentSource
 from onyx.configs.constants import FileOrigin
 from onyx.connectors.cross_connector_utils.miscellaneous_utils import (
     process_onyx_metadata,
+)
+from onyx.connectors.cross_connector_utils.tabular_section_utils import (
+    extract_and_stage_tabular_file,
 )
 from onyx.connectors.cross_connector_utils.tabular_section_utils import is_tabular_file
 from onyx.connectors.cross_connector_utils.tabular_section_utils import (
@@ -50,6 +54,9 @@ from onyx.file_processing.file_types import OnyxFileExtensions
 from onyx.file_processing.image_utils import store_image_and_create_section
 from onyx.utils.logger import setup_logger
 
+if TYPE_CHECKING:
+    from mypy_boto3_s3 import S3Client
+
 logger = setup_logger()
 
 
@@ -70,7 +77,7 @@ class BlobStorageConnector(LoadConnector, PollConnector):
         self.bucket_name = bucket_name.strip()
         self.prefix = prefix if not prefix or prefix.endswith("/") else prefix + "/"
         self.batch_size = batch_size
-        self.s3_client: Optional[S3Client] = None
+        self.s3_client: Optional["S3Client"] = None
         self._allow_images: bool | None = None
         self.size_threshold: int | None = BLOB_STORAGE_SIZE_THRESHOLD
         self.bucket_region: Optional[str] = None
@@ -80,7 +87,7 @@ class BlobStorageConnector(LoadConnector, PollConnector):
         self, allow_images: bool
     ) -> None:
         """Set whether to process images in this connector."""
-        logger.info(f"Setting allow_images to {allow_images}.")
+        logger.info("Setting allow_images to %s.", allow_images)
         self._allow_images = allow_images
 
     def _detect_bucket_region(self) -> None:
@@ -99,11 +106,11 @@ class BlobStorageConnector(LoadConnector, PollConnector):
             ).get("HTTPHeaders", {}).get("x-amz-bucket-region")
 
             if self.bucket_region:
-                logger.debug(f"Detected bucket region: {self.bucket_region}")
+                logger.debug("Detected bucket region: %s", self.bucket_region)
             else:
                 logger.warning("Bucket region not found in head_bucket response")
         except Exception as e:
-            logger.warning(f"Failed to detect bucket region via head_bucket: {e}")
+            logger.warning("Failed to detect bucket region via head_bucket: %s", e)
 
     def load_credentials(self, credentials: dict[str, Any]) -> dict[str, Any] | None:
         """Checks for boto3 credentials based on the bucket type.
@@ -123,7 +130,7 @@ class BlobStorageConnector(LoadConnector, PollConnector):
         """
 
         logger.debug(
-            f"Loading credentials for {self.bucket_name} or type {self.bucket_type}"
+            "Loading credentials for %s or type %s", self.bucket_name, self.bucket_type
         )
 
         if self.bucket_type == BlobType.R2:
@@ -152,7 +159,7 @@ class BlobStorageConnector(LoadConnector, PollConnector):
                 "authentication_method", "access_key"
             )
             logger.debug(
-                f"Using authentication method: {authentication_method} for S3 bucket."
+                "Using authentication method: %s for S3 bucket.", authentication_method
             )
             if authentication_method == "access_key":
                 logger.debug("Using access key authentication for S3 bucket.")
@@ -279,7 +286,9 @@ class BlobStorageConnector(LoadConnector, PollConnector):
 
             if bytes_read > self.size_threshold + SIZE_THRESHOLD_BUFFER:
                 logger.warning(
-                    f"{key} exceeds size threshold of {self.size_threshold}. Skipping."
+                    "%s exceeds size threshold of %s. Skipping.",
+                    key,
+                    self.size_threshold,
                 )
                 return None
 
@@ -414,7 +423,9 @@ class BlobStorageConnector(LoadConnector, PollConnector):
                     and size_bytes > self.size_threshold
                 ):
                     logger.warning(
-                        f"{file_name} exceeds size threshold of {self.size_threshold}. Skipping."
+                        "%s exceeds size threshold of %s. Skipping.",
+                        file_name,
+                        self.size_threshold,
                     )
                     continue
 
@@ -422,7 +433,8 @@ class BlobStorageConnector(LoadConnector, PollConnector):
                 if file_ext in OnyxFileExtensions.IMAGE_EXTENSIONS:
                     if not self._allow_images:
                         logger.debug(
-                            f"Skipping image file: {key} (image processing not enabled)"
+                            "Skipping image file: %s (image processing not enabled)",
+                            key,
                         )
                         continue
 
@@ -457,7 +469,7 @@ class BlobStorageConnector(LoadConnector, PollConnector):
                             yield batch
                             batch = []
                     except Exception:
-                        logger.exception(f"Error processing image {key}")
+                        logger.exception("Error processing image %s", key)
                     continue
 
                 # Handle tabular files (xlsx, csv, tsv) — produce one
@@ -468,11 +480,25 @@ class BlobStorageConnector(LoadConnector, PollConnector):
                         downloaded_file = self._download_object(key)
                         if downloaded_file is None:
                             continue
-                        tabular_sections = tabular_file_to_sections(
-                            BytesIO(downloaded_file),
-                            file_name=file_name,
-                            link=link,
-                        )
+                        tabular_sections: list[TabularSection] = []
+                        staged_file_id: str | None = None
+                        if self.raw_file_callback is not None:
+                            content_type, _ = mimetypes.guess_type(file_name)
+                            result = extract_and_stage_tabular_file(
+                                file=BytesIO(downloaded_file),
+                                file_name=file_name,
+                                content_type=content_type or "application/octet-stream",
+                                raw_file_callback=self.raw_file_callback,
+                                link=link,
+                            )
+                            tabular_sections = result.sections
+                            staged_file_id = result.staged_file_id
+                        else:
+                            tabular_sections = tabular_file_to_sections(
+                                BytesIO(downloaded_file),
+                                file_name=file_name,
+                                link=link,
+                            )
                         batch.append(
                             Document(
                                 id=f"{self.bucket_type}:{self.bucket_name}:{key}",
@@ -485,13 +511,14 @@ class BlobStorageConnector(LoadConnector, PollConnector):
                                 semantic_identifier=file_name,
                                 doc_updated_at=last_modified,
                                 metadata={},
+                                file_id=staged_file_id,
                             )
                         )
                         if len(batch) == self.batch_size:
                             yield batch
                             batch = []
                     except Exception:
-                        logger.exception(f"Error processing tabular file {key}")
+                        logger.exception("Error processing tabular file %s", key)
                     continue
 
                 # Handle text and document files
@@ -518,7 +545,7 @@ class BlobStorageConnector(LoadConnector, PollConnector):
                     sections: list[TextSection | ImageSection] = []
                     if extraction_result.text_content.strip():
                         logger.debug(
-                            f"Creating TextSection for {file_name} with link: {link}"
+                            "Creating TextSection for %s with link: %s", file_name, link
                         )
                         sections.append(
                             TextSection(
@@ -548,7 +575,7 @@ class BlobStorageConnector(LoadConnector, PollConnector):
                         batch = []
 
                 except Exception:
-                    logger.exception(f"Error decoding object {key} as UTF-8")
+                    logger.exception("Error decoding object %s as UTF-8", key)
         if batch:
             yield batch
 

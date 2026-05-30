@@ -1,11 +1,7 @@
 "use client";
 
 import { create } from "zustand";
-import { getDemoDataEnabled } from "@/app/craft/v1/constants";
-import {
-  getBuildUserPersona,
-  getBuildLlmSelection,
-} from "@/app/craft/onboarding/constants";
+import { getBuildLlmSelection } from "@/app/craft/onboarding/constants";
 import { DELETE_SUCCESS_DISPLAY_DURATION_MS } from "@/app/craft/constants";
 
 import {
@@ -25,6 +21,12 @@ import {
   ToolCallState,
   TodoListState,
 } from "@/app/craft/types/displayTypes";
+
+import {
+  QueuedMessage,
+  MAX_QUEUED_MESSAGES,
+  EMPTY_QUEUED_MESSAGES,
+} from "@/app/app/interfaces";
 
 import {
   createSession as apiCreateSession,
@@ -256,12 +258,15 @@ export type {
 /** Pre-provisioning state machine - exactly one of these states at a time */
 export type PreProvisioningState =
   | { status: "idle" }
-  | { status: "provisioning"; demoDataEnabled: boolean }
-  | { status: "ready"; sessionId: string; demoDataEnabled: boolean }
+  | { status: "provisioning" }
+  | { status: "ready"; sessionId: string }
   | { status: "failed"; error: string; retryCount: number; retryAt: number };
 
 // Module-level variable to store the provisioning promise (not in Zustand state for serializability)
 let provisioningPromise: Promise<string | null> | null = null;
+
+// Monotonic id for queued messages (kept out of Zustand state for simplicity).
+let nextQueuedMessageId = 1;
 
 /** File preview tab data */
 export interface FilePreviewTab {
@@ -288,12 +293,6 @@ export interface TabNavigationHistory {
   currentIndex: number;
 }
 
-/** Follow-up suggestion bubble */
-export interface SuggestionBubble {
-  theme: "add" | "question";
-  text: string;
-}
-
 /** Output panel tab types */
 export type OutputTabType = "preview" | "files" | "artifacts";
 
@@ -310,6 +309,11 @@ export interface BuildSessionData {
    * Rendered directly without transformation.
    */
   streamItems: StreamItem[];
+  /**
+   * Messages typed while a response is streaming. Auto-sent FIFO once the
+   * current run finishes (see the auto-send effect in BuildChatPanel).
+   */
+  queuedMessages: QueuedMessage[];
   error: string | null;
   webappUrl: string | null;
   /** Sandbox info from backend */
@@ -332,10 +336,6 @@ export interface BuildSessionData {
   filesTabState: FilesTabState;
   /** Browser-style tab navigation history for back/forward */
   tabHistory: TabNavigationHistory;
-  /** Follow-up suggestions after first agent message */
-  followupSuggestions: SuggestionBubble[] | null;
-  /** Whether suggestions are currently being generated */
-  suggestionsLoading: boolean;
 }
 
 interface BuildSessionStore {
@@ -426,6 +426,10 @@ interface BuildSessionStore {
   ) => void;
   clearStreamItems: (sessionId: string) => void;
 
+  // Actions - Queued Messages
+  enqueueMessage: (sessionId: string, text: string) => void;
+  removeQueuedMessage: (sessionId: string, index: number) => void;
+
   // Actions - Abort Control
   setAbortController: (sessionId: string, controller: AbortController) => void;
   abortSession: (sessionId: string) => void;
@@ -479,14 +483,6 @@ interface BuildSessionStore {
   // Tab Navigation History Actions
   navigateTabBack: (sessionId: string) => void;
   navigateTabForward: (sessionId: string) => void;
-
-  // Follow-up Suggestion Actions
-  setFollowupSuggestions: (
-    sessionId: string,
-    suggestions: SuggestionBubble[] | null
-  ) => void;
-  setSuggestionsLoading: (sessionId: string, loading: boolean) => void;
-  clearFollowupSuggestions: (sessionId: string) => void;
 }
 
 // =============================================================================
@@ -503,6 +499,7 @@ const createInitialSessionData = (
   artifacts: [],
   toolCalls: [],
   streamItems: [],
+  queuedMessages: [],
   error: null,
   webappUrl: null,
   sandbox: null,
@@ -520,8 +517,6 @@ const createInitialSessionData = (
     entries: [{ type: "pinned", tab: "preview" }],
     currentIndex: 0,
   },
-  followupSuggestions: null,
-  suggestionsLoading: false,
   ...initialData,
 });
 
@@ -1092,6 +1087,45 @@ export const useBuildSessionStore = create<BuildSessionStore>()((set, get) => ({
   },
 
   // ===========================================================================
+  // Queued Messages
+  // ===========================================================================
+
+  enqueueMessage: (sessionId: string, text: string) => {
+    set((state) => {
+      const session = state.sessions.get(sessionId);
+      if (!session || session.queuedMessages.length >= MAX_QUEUED_MESSAGES) {
+        return state;
+      }
+      const updatedSession: BuildSessionData = {
+        ...session,
+        queuedMessages: [
+          ...session.queuedMessages,
+          { id: nextQueuedMessageId++, text },
+        ],
+        lastAccessed: new Date(),
+      };
+      const newSessions = new Map(state.sessions);
+      newSessions.set(sessionId, updatedSession);
+      return { sessions: newSessions };
+    });
+  },
+
+  removeQueuedMessage: (sessionId: string, index: number) => {
+    set((state) => {
+      const session = state.sessions.get(sessionId);
+      if (!session) return state;
+      const updatedSession: BuildSessionData = {
+        ...session,
+        queuedMessages: session.queuedMessages.filter((_, i) => i !== index),
+        lastAccessed: new Date(),
+      };
+      const newSessions = new Map(state.sessions);
+      newSessions.set(sessionId, updatedSession);
+      return { sessions: newSessions };
+    });
+  },
+
+  // ===========================================================================
   // Abort Control (mirrors chat's per-session pattern)
   // ===========================================================================
 
@@ -1127,20 +1161,15 @@ export const useBuildSessionStore = create<BuildSessionStore>()((set, get) => ({
       refreshSessionHistory,
       nameBuildSession,
     } = get();
-    // Read from cookie - single source of truth
-    const demoDataEnabled = getDemoDataEnabled();
 
-    // Create a temporary session ID for optimistic UI
     const tempId = `temp-${Date.now()}`;
     setCurrentSession(tempId);
     updateSessionData(tempId, { status: "creating" });
 
     try {
-      // Get LLM selection from cookie
       const llmSelection = getBuildLlmSelection();
       const sessionData = await apiCreateSession({
         name: prompt.slice(0, 50),
-        demoDataEnabled,
         llmProviderType: llmSelection?.provider || null,
         llmModelName: llmSelection?.modelName || null,
       });
@@ -1426,67 +1455,38 @@ export const useBuildSessionStore = create<BuildSessionStore>()((set, get) => ({
 
   ensurePreProvisionedSession: async () => {
     const { preProvisioning } = get();
-    // Read from cookie - single source of truth
-    const demoDataEnabled = getDemoDataEnabled();
 
-    // Already have a pre-provisioned session ready
     if (preProvisioning.status === "ready") {
-      // If demoDataEnabled matches, return the existing session
-      if (preProvisioning.demoDataEnabled === demoDataEnabled) {
-        return preProvisioning.sessionId;
-      }
-      // demoDataEnabled changed - invalidate and re-provision
-      const sessionIdToDelete = preProvisioning.sessionId;
-      set({ preProvisioning: { status: "idle" } });
-      apiDeleteSession(sessionIdToDelete).catch((err) => {
-        console.error(
-          "[PreProvision] Failed to delete invalidated session:",
-          err
-        );
-      });
-      // Fall through to create a new session with the current setting
+      return preProvisioning.sessionId;
     }
 
-    // Already provisioning - return existing promise
     if (preProvisioning.status === "provisioning") {
       return provisioningPromise;
     }
 
-    // Handle failed state with retry
-    // Capture retryCount BEFORE resetting to idle (so we can increment it on next failure)
     let currentRetryCount = 0;
     if (preProvisioning.status === "failed") {
       currentRetryCount = preProvisioning.retryCount;
       if (Date.now() < preProvisioning.retryAt) {
-        // Not yet time to retry
         return null;
       }
-      // Time to retry - reset to idle and continue
       set({ preProvisioning: { status: "idle" } });
     }
 
-    // Start new provisioning with current demoDataEnabled value
-
     const promise = (async (): Promise<string | null> => {
       try {
-        // Parse user persona and LLM selection from cookies
-        const persona = getBuildUserPersona();
         const llmSelection = getBuildLlmSelection();
 
         const sessionData = await apiCreateSession({
-          demoDataEnabled,
-          userWorkArea: persona?.workArea || null,
-          userLevel: persona?.level || null,
           llmProviderType: llmSelection?.provider || null,
           llmModelName: llmSelection?.modelName || null,
         });
 
-        provisioningPromise = null; // Clear promise on success
+        provisioningPromise = null;
         set({
           preProvisioning: {
             status: "ready",
             sessionId: sessionData.id,
-            demoDataEnabled,
           },
         });
         return sessionData.id;
@@ -1495,14 +1495,13 @@ export const useBuildSessionStore = create<BuildSessionStore>()((set, get) => ({
         const errorMessage =
           err instanceof Error ? err.message : "Unknown error";
 
-        // Exponential backoff: 1s, 2s, 4s, 8s, ... max 30s
         const newRetryCount = currentRetryCount + 1;
         const backoffMs = Math.min(
           1000 * Math.pow(2, newRetryCount - 1),
           30000
         );
 
-        provisioningPromise = null; // Clear promise on failure
+        provisioningPromise = null;
         set({
           preProvisioning: {
             status: "failed",
@@ -1517,7 +1516,7 @@ export const useBuildSessionStore = create<BuildSessionStore>()((set, get) => ({
 
     provisioningPromise = promise;
     set({
-      preProvisioning: { status: "provisioning", demoDataEnabled },
+      preProvisioning: { status: "provisioning" },
     });
     return promise;
   },
@@ -1957,63 +1956,6 @@ export const useBuildSessionStore = create<BuildSessionStore>()((set, get) => ({
       return { sessions: newSessions };
     });
   },
-
-  // ===========================================================================
-  // Follow-up Suggestion Actions
-  // ===========================================================================
-
-  setFollowupSuggestions: (
-    sessionId: string,
-    suggestions: SuggestionBubble[] | null
-  ) => {
-    set((state) => {
-      const session = state.sessions.get(sessionId);
-      if (!session) return state;
-
-      const updatedSession: BuildSessionData = {
-        ...session,
-        followupSuggestions: suggestions,
-        suggestionsLoading: false,
-        lastAccessed: new Date(),
-      };
-      const newSessions = new Map(state.sessions);
-      newSessions.set(sessionId, updatedSession);
-      return { sessions: newSessions };
-    });
-  },
-
-  setSuggestionsLoading: (sessionId: string, loading: boolean) => {
-    set((state) => {
-      const session = state.sessions.get(sessionId);
-      if (!session) return state;
-
-      const updatedSession: BuildSessionData = {
-        ...session,
-        suggestionsLoading: loading,
-        lastAccessed: new Date(),
-      };
-      const newSessions = new Map(state.sessions);
-      newSessions.set(sessionId, updatedSession);
-      return { sessions: newSessions };
-    });
-  },
-
-  clearFollowupSuggestions: (sessionId: string) => {
-    set((state) => {
-      const session = state.sessions.get(sessionId);
-      if (!session) return state;
-
-      const updatedSession: BuildSessionData = {
-        ...session,
-        followupSuggestions: null,
-        suggestionsLoading: false,
-        lastAccessed: new Date(),
-      };
-      const newSessions = new Map(state.sessions);
-      newSessions.set(sessionId, updatedSession);
-      return { sessions: newSessions };
-    });
-  },
 }));
 
 // =============================================================================
@@ -2122,11 +2064,6 @@ export const usePreProvisionedSessionId = () =>
       : null
   );
 
-// Demo data selector - reads directly from cookie (single source of truth)
-// Note: This returns the current cookie value but doesn't trigger re-renders on change.
-// Components that need reactive updates should manage their own local state.
-export const useDemoDataEnabled = () => getDemoDataEnabled();
-
 // Controller state selectors (for useBuildSessionController)
 export const useControllerState = () =>
   useBuildSessionStore((state) => state.controllerState);
@@ -2146,6 +2083,16 @@ export const useStreamItems = () =>
     const { currentSessionId, sessions } = state;
     if (!currentSessionId) return EMPTY_ARRAY;
     return sessions.get(currentSessionId)?.streamItems ?? EMPTY_ARRAY;
+  });
+
+// Queued messages selector
+export const useQueuedMessages = () =>
+  useBuildSessionStore((state) => {
+    const { currentSessionId, sessions } = state;
+    if (!currentSessionId) return EMPTY_QUEUED_MESSAGES;
+    return (
+      sessions.get(currentSessionId)?.queuedMessages ?? EMPTY_QUEUED_MESSAGES
+    );
   });
 
 // Webapp refresh selector
@@ -2202,19 +2149,4 @@ export const useTabHistory = () =>
     const { currentSessionId, sessions } = state;
     if (!currentSessionId) return EMPTY_TAB_HISTORY;
     return sessions.get(currentSessionId)?.tabHistory ?? EMPTY_TAB_HISTORY;
-  });
-
-// Follow-up suggestion selectors
-export const useFollowupSuggestions = () =>
-  useBuildSessionStore((state) => {
-    const { currentSessionId, sessions } = state;
-    if (!currentSessionId) return null;
-    return sessions.get(currentSessionId)?.followupSuggestions ?? null;
-  });
-
-export const useSuggestionsLoading = () =>
-  useBuildSessionStore((state) => {
-    const { currentSessionId, sessions } = state;
-    if (!currentSessionId) return false;
-    return sessions.get(currentSessionId)?.suggestionsLoading ?? false;
   });
